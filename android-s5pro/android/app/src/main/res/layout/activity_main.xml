@@ -86,7 +86,7 @@
             android:id="@+id/fujiCheck"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="同时输出富士色彩 JPEG（内嵌曲线渲染，推荐）"
+            android:text="同时输出富士色彩 JPEG（相机白平衡+富士色矩阵渲染，推荐）"
             android:textSize="13sp"
             android:checked="true"/>
     </LinearLayout>

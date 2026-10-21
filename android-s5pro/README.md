@@ -9,14 +9,15 @@
 - **缩略图墙**：直接从 RAF 内嵌预览秒出小图（无需先解码 RAW）
 - **EXIF 面板**：长按条目查看机型/镜头/ISO/光圈/快门/白平衡/动态范围参数
 - **DNG 输出**：S/R 合并后 6MP CFA DNG，存 `Download/s5dng/<名>_merged.dng`（Lightroom/Snapseed 可直接编辑）
-- **★ 富士色彩 JPEG（v1.2 新增）**：走 LibRaw 全渲染管线——**相机内嵌色调曲线 + 相机白平衡 + sRGB**，即官方转换器色彩科学中 Lightroom 解 CFA DNG 时看不到的那块数据（LibRaw `mem_image.cpp` 逐像素应用 `color.curve`，已源码验证）；带水印输出 `<名>_fuji.jpg`
+- **★ 富士色彩 JPEG（v1.2 新增）**：LibRaw 显示级全渲染——**相机白平衡 + dcraw S5 Pro 色彩矩阵 + sRGB + 完整 fuji_rotate 几何**，不经过 Lightroom 对 CFA DNG 的二次解读，直出机身观感 JPEG；带水印输出 `<名>_fuji.jpg`
 - **水印分享 JPEG**：未开启富士色彩时回退到内嵌预览水印版（`<名>_share.jpg`）
 - **S→R 合并曲线调节**：起点/宽度/平滑度三滑杆（对应 CLI `--start/--delay/--smoothness`）
 - 全程离线 · 无任何第三方依赖 · API 29+（Android 10/11/12/13/14+）
 
-### 富士色彩模式的技术依据（逆向调研结论，详见 富士RAW转换器研究.md）
+### 富士色彩模式的技术依据（逆向调研结论，详见 富士RAW转换器研究.md / 肤色科学技术分析.md）
 - 小红书实拍派用 **RAW FILE CONVERTER EX 3.0 powered by SILKYPIX**（富士官网免费、2026-03 仍更新、明确支持 S5 Pro）直出零后期肤色；社区共识「只有 Silkypix 和 Capture One 拿到了富士色彩科技授权」
-- 差异主因：① RAF 是双帧文件，通用引擎只读 S 帧（本 App 的 DNG 路径是**完整 S/R 合并**，反而更全）；② 相机内嵌色调曲线只有官方管线会应用（本模式的 JPEG 路径通过 LibRaw 应用同一曲线）；③ SILKYPIX 新引擎去马赛克代差（无法复刻，诚实承认）
+- 差异主因：① RAF 是双帧文件，通用引擎只读 S 帧（本 App 的 DNG 路径是**完整 S/R 合并**，反而更全）；② 官方独家 3D-LUT 色彩科技与 SILKYPIX 新引擎去马赛克（无法复刻，诚实承认）；③ **源码级考据澄清**：S5 Pro 的 RAF 不含可解析的色调曲线表（LibRaw `color.curve` 对富士保持恒等），机身色调只存在于 JPEG 管线与闭源官方转换器——因此本模式的价值在「相机白平衡 + 富士色矩阵 + 零二次解读」，而非曲线
+- **v1.3 方向**：胶片模式预设。已考据 S5 Pro 全套模式 = Standard + F1（影棚人像负片）/ F1a（饱和略增）/ F1b（日光人像肤色平滑）/ F1c（增锐）/ F2（=Velvia），作用于 Color/Tone/Sharpness 三参数；且 HS-V3 显影 RAF 时本就支持后期重选胶片模拟（Standard/Pro Negative/F3a/F3b/F3c/Fujichrome）——预设近似有官方先例
 
 ## 本机验证结论（2026-10-21，Windows x64，MSYS2 GCC 16.2）
 
