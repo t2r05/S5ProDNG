@@ -1,0 +1,5627 @@
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "SuperCCDProcessor.h"
+#include "AmazeDemosaic.h"
+#include "CfaPlaneAlignment.h"
+#include "DngWriter.h"
+#include "ParallelProcessing.h"
+#include "PreviewColorNormalization.h"
+
+#include <libraw/libraw.h>
+#include <QFileInfo>
+#include <QImageReader>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QDir>
+#include <QFile>
+#include <QTextStream>
+#include <fstream>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <cstdarg>
+#include <climits>
+#include <cmath>
+#include <algorithm>
+#include <array>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#endif
+
+namespace {
+struct PairStats {
+    uint64_t count = 0;
+    double meanA = 0.0;
+    double meanB = 0.0;
+    double meanRatio = 0.0;
+    double meanAbsDiff = 0.0;
+    double corr = 0.0;
+};
+
+struct OffsetScore {
+    int dx = 0;
+    int dy = 0;
+    uint64_t count = 0;
+    double gain = 1.0;
+    double meanRelativeError = 0.0;
+    double corr = 0.0;
+};
+
+struct LinearShotPlanes {
+    std::vector<uint16_t> g1;
+    std::vector<uint16_t> r;
+    std::vector<uint16_t> b;
+    std::vector<uint16_t> g2;
+    int width = 0;
+    int height = 0;
+    int expandedWidth = 0;
+};
+
+bool applyPreviewRotationAndScale(const QImage &source,
+                                  int previewRotation,
+                                  int maxSize,
+                                  QImage &preview,
+                                  QString &error);
+
+void populateBasicMetadata(LibRaw &raw, SuperCCDMetadata &metadata)
+{
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.lensModel = QString::fromUtf8(raw.imgdata.lens.Lens).trimmed();
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    metadata.focalLength = raw.imgdata.other.focal_len;
+    metadata.fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+    metadata.flip = raw.imgdata.sizes.flip;
+    metadata.hasFlip = (metadata.flip != 0);
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm localTime {};
+#ifdef _WIN32
+        localtime_s(&localTime, &raw.imgdata.other.timestamp);
+#else
+        localtime_r(&raw.imgdata.other.timestamp, &localTime);
+#endif
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", &localTime);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+}
+
+#ifdef __APPLE__
+CFStringRef createCFString(const QString &value)
+{
+    return CFStringCreateWithCharacters(kCFAllocatorDefault,
+                                        reinterpret_cast<const UniChar *>(value.utf16()),
+                                        static_cast<CFIndex>(value.size()));
+}
+
+CFURLRef createFileUrl(const QString &path)
+{
+    const QByteArray utf8Path = QFile::encodeName(path);
+    return CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault,
+                                                   reinterpret_cast<const UInt8 *>(utf8Path.constData()),
+                                                   static_cast<CFIndex>(utf8Path.size()),
+                                                   false);
+}
+
+void setDictionaryString(CFMutableDictionaryRef dictionary, const CFStringRef key, const QString &value)
+{
+    const QString trimmed = value.trimmed();
+    if (!dictionary || trimmed.isEmpty()) {
+        return;
+    }
+    CFStringRef text = createCFString(trimmed);
+    if (!text) {
+        return;
+    }
+    CFDictionarySetValue(dictionary, key, text);
+    CFRelease(text);
+}
+
+void setDictionaryDouble(CFMutableDictionaryRef dictionary, const CFStringRef key, double value)
+{
+    if (!dictionary || value <= 0.0) {
+        return;
+    }
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &value);
+    if (!number) {
+        return;
+    }
+    CFDictionarySetValue(dictionary, key, number);
+    CFRelease(number);
+}
+
+void setDictionaryInt(CFMutableDictionaryRef dictionary, const CFStringRef key, int value)
+{
+    if (!dictionary || value <= 0) {
+        return;
+    }
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+    if (!number) {
+        return;
+    }
+    CFDictionarySetValue(dictionary, key, number);
+    CFRelease(number);
+}
+
+bool writeImageMetadataWithImageIO(const QString &outputPath,
+                                   const SuperCCDMetadata &metadata,
+                                   QString *error)
+{
+    const QString suffix = QFileInfo(outputPath).suffix().toLower();
+    const bool isJpeg = (suffix == QStringLiteral("jpg") || suffix == QStringLiteral("jpeg"));
+    const bool isTiff = (suffix == QStringLiteral("tif") || suffix == QStringLiteral("tiff"));
+    if (!isJpeg && !isTiff) {
+        return false;
+    }
+
+    CFURLRef sourceUrl = createFileUrl(outputPath);
+    if (!sourceUrl) {
+        if (error) *error = QStringLiteral("Could not create ImageIO source URL.");
+        return false;
+    }
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL(sourceUrl, nullptr);
+    if (!source) {
+        CFRelease(sourceUrl);
+        if (error) *error = QStringLiteral("Could not open image for ImageIO metadata update.");
+        return false;
+    }
+
+    CFTypeRef sourceType = CGImageSourceGetType(source);
+    if (!sourceType) {
+        CFRelease(source);
+        CFRelease(sourceUrl);
+        if (error) *error = QStringLiteral("Could not determine image type.");
+        return false;
+    }
+
+    CFDictionaryRef existingProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr);
+    CFMutableDictionaryRef properties = existingProperties
+        ? CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, existingProperties)
+        : CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                    0,
+                                    &kCFTypeDictionaryKeyCallBacks,
+                                    &kCFTypeDictionaryValueCallBacks);
+
+    CFDictionaryRef existingExif = existingProperties
+        ? static_cast<CFDictionaryRef>(CFDictionaryGetValue(existingProperties, kCGImagePropertyExifDictionary))
+        : nullptr;
+    CFMutableDictionaryRef exifDictionary = existingExif
+        ? CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, existingExif)
+        : CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                    0,
+                                    &kCFTypeDictionaryKeyCallBacks,
+                                    &kCFTypeDictionaryValueCallBacks);
+
+    CFDictionaryRef existingTiff = existingProperties
+        ? static_cast<CFDictionaryRef>(CFDictionaryGetValue(existingProperties, kCGImagePropertyTIFFDictionary))
+        : nullptr;
+    CFMutableDictionaryRef tiffDictionary = existingTiff
+        ? CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, existingTiff)
+        : CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                    0,
+                                    &kCFTypeDictionaryKeyCallBacks,
+                                    &kCFTypeDictionaryValueCallBacks);
+
+    setDictionaryString(tiffDictionary, kCGImagePropertyTIFFMake, metadata.make);
+    setDictionaryString(tiffDictionary, kCGImagePropertyTIFFModel, metadata.model);
+    setDictionaryString(tiffDictionary, kCGImagePropertyTIFFSoftware, metadata.software);
+    setDictionaryString(tiffDictionary, kCGImagePropertyTIFFDateTime, metadata.dateTime);
+
+    setDictionaryString(exifDictionary, kCGImagePropertyExifLensModel, metadata.lensModel);
+    setDictionaryDouble(exifDictionary, kCGImagePropertyExifFocalLength, metadata.focalLength);
+    setDictionaryDouble(exifDictionary, kCGImagePropertyExifFNumber, metadata.aperture);
+    setDictionaryDouble(exifDictionary, kCGImagePropertyExifExposureTime, metadata.shutter);
+    setDictionaryString(exifDictionary, kCGImagePropertyExifDateTimeOriginal, metadata.dateTime);
+    setDictionaryString(exifDictionary, kCGImagePropertyExifDateTimeDigitized, metadata.dateTime);
+
+    if (metadata.iso > 0) {
+        CFMutableArrayRef isoArray = CFArrayCreateMutable(kCFAllocatorDefault, 1, &kCFTypeArrayCallBacks);
+        if (isoArray) {
+            CFNumberRef isoNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &metadata.iso);
+            if (isoNumber) {
+                CFArrayAppendValue(isoArray, isoNumber);
+                CFDictionarySetValue(exifDictionary, kCGImagePropertyExifISOSpeedRatings, isoArray);
+                CFRelease(isoNumber);
+            }
+            CFRelease(isoArray);
+        }
+        setDictionaryInt(exifDictionary, kCGImagePropertyExifISOSpeed, metadata.iso);
+        setDictionaryInt(exifDictionary, kCGImagePropertyExifSensitivityType, 3);
+    }
+
+    CFDictionarySetValue(properties, kCGImagePropertyExifDictionary, exifDictionary);
+    CFDictionarySetValue(properties, kCGImagePropertyTIFFDictionary, tiffDictionary);
+
+    const QString tempPath = outputPath + QStringLiteral(".metadata_tmp");
+    QFile::remove(tempPath);
+    CFURLRef destinationUrl = createFileUrl(tempPath);
+    if (!destinationUrl) {
+        if (error) *error = QStringLiteral("Could not create ImageIO destination URL.");
+        CFRelease(tiffDictionary);
+        CFRelease(exifDictionary);
+        CFRelease(properties);
+        if (existingProperties) CFRelease(existingProperties);
+        CFRelease(source);
+        CFRelease(sourceUrl);
+        return false;
+    }
+
+    CGImageDestinationRef destination = CGImageDestinationCreateWithURL(destinationUrl,
+                                                                        static_cast<CFStringRef>(sourceType),
+                                                                        1,
+                                                                        nullptr);
+    if (!destination) {
+        if (error) *error = QStringLiteral("Could not create ImageIO destination.");
+        CFRelease(destinationUrl);
+        CFRelease(tiffDictionary);
+        CFRelease(exifDictionary);
+        CFRelease(properties);
+        if (existingProperties) CFRelease(existingProperties);
+        CFRelease(source);
+        CFRelease(sourceUrl);
+        return false;
+    }
+
+    CGImageDestinationAddImageFromSource(destination, source, 0, properties);
+    const bool finalized = CGImageDestinationFinalize(destination);
+
+    CFRelease(destination);
+    CFRelease(destinationUrl);
+    CFRelease(tiffDictionary);
+    CFRelease(exifDictionary);
+    CFRelease(properties);
+    if (existingProperties) CFRelease(existingProperties);
+    CFRelease(source);
+    CFRelease(sourceUrl);
+
+    if (!finalized) {
+        QFile::remove(tempPath);
+        if (error) *error = QStringLiteral("ImageIO could not finalize metadata update.");
+        return false;
+    }
+
+    if (!QFile::remove(outputPath) || !QFile::rename(tempPath, outputPath)) {
+        QFile::remove(tempPath);
+        if (error) *error = QStringLiteral("Could not replace image after metadata update.");
+        return false;
+    }
+
+    return true;
+}
+#endif
+
+void logProcessing(const char *format, ...)
+{
+    static std::mutex logMutex;
+    const std::lock_guard<std::mutex> lock(logMutex);
+
+    va_list args;
+    va_start(args, format);
+    time_t t = time(NULL);
+    char timestr[32];
+    struct tm localTime {};
+#ifdef _WIN32
+    localtime_s(&localTime, &t);
+#else
+    localtime_r(&t, &localTime);
+#endif
+    strftime(timestr, sizeof(timestr), "%Y-%m-%dT%H:%M:%S", &localTime);
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dir.isEmpty()) {
+        dir = QDir::homePath();
+    }
+    QDir d(dir);
+    if (!d.exists()) {
+        d.mkpath(dir);
+    }
+    const QString logPath = d.filePath(QStringLiteral("processing.log"));
+    FILE *f = fopen(logPath.toUtf8().constData(), "a");
+    if (f) {
+        fprintf(f, "%s - ", timestr);
+        vfprintf(f, format, args);
+        fprintf(f, "\n");
+        fclose(f);
+    }
+    va_end(args);
+}
+
+QImage qImageFromLibRawProcessedThumb(const libraw_processed_image_t *thumb)
+{
+    if (!thumb || !thumb->data || thumb->width <= 0 || thumb->height <= 0) {
+        return QImage();
+    }
+
+    if (thumb->type == LIBRAW_IMAGE_JPEG) {
+        return QImage::fromData(reinterpret_cast<const uchar *>(thumb->data),
+                                thumb->data_size,
+                                "JPEG");
+    }
+
+    if (thumb->type != LIBRAW_IMAGE_BITMAP) {
+        return QImage();
+    }
+
+    const int width = static_cast<int>(thumb->width);
+    const int height = static_cast<int>(thumb->height);
+    const int colors = static_cast<int>(thumb->colors);
+    const int bits = static_cast<int>(thumb->bits);
+    if (colors <= 0 || (bits != 8 && bits != 16)) {
+        return QImage();
+    }
+
+    QImage image(width, height, QImage::Format_RGB32);
+    if (image.isNull()) {
+        return QImage();
+    }
+
+    const uchar *src8 = reinterpret_cast<const uchar *>(thumb->data);
+    const ushort *src16 = reinterpret_cast<const ushort *>(thumb->data);
+    const int samplesPerPixel = colors;
+    for (int y = 0; y < height; ++y) {
+        QRgb *dst = reinterpret_cast<QRgb *>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) {
+            const int idx = (y * width + x) * samplesPerPixel;
+            int r = 0;
+            int g = 0;
+            int b = 0;
+            if (bits == 8) {
+                if (colors >= 3) {
+                    r = src8[idx + 0];
+                    g = src8[idx + 1];
+                    b = src8[idx + 2];
+                } else {
+                    r = g = b = src8[idx];
+                }
+            } else {
+                if (colors >= 3) {
+                    r = src16[idx + 0] >> 8;
+                    g = src16[idx + 1] >> 8;
+                    b = src16[idx + 2] >> 8;
+                } else {
+                    r = g = b = src16[idx] >> 8;
+                }
+            }
+            dst[x] = qRgb(r, g, b);
+        }
+    }
+    return image;
+}
+
+// Direct JPEG thumbnail extraction from RAF files
+// RAF files contain an embedded JPEG thumbnail that can be extracted directly
+// without relying on external tools like exiftool
+QImage extractEmbeddedJpegFromRaf(const QString &inputPath, QString *error = nullptr)
+{
+    QFile file(inputPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("Cannot open file for direct thumbnail extraction");
+        return QImage();
+    }
+
+    const QByteArray data = file.readAll();
+    file.close();
+
+    if (data.size() < 12) {
+        if (error) *error = QStringLiteral("File too small for RAF format");
+        return QImage();
+    }
+
+    // Search for JPEG SOI marker (0xFF 0xD8) in the file
+    // RAF files typically have the JPEG thumbnail embedded somewhere in the file
+    const uchar *buf = reinterpret_cast<const uchar *>(data.constData());
+    const size_t size = static_cast<size_t>(data.size());
+
+    // Search for JPEG start marker
+    const int soiMarker[2] = {0xFF, 0xD8};
+    size_t jpegStart = 0;
+    for (size_t i = 0; i < size - 1; ++i) {
+        if (buf[i] == soiMarker[0] && buf[i + 1] == soiMarker[1]) {
+            jpegStart = i;
+            break;
+        }
+    }
+
+    if (jpegStart == 0) {
+        if (error) *error = QStringLiteral("No JPEG thumbnail found in RAF file");
+        return QImage();
+    }
+
+    // Search for JPEG EOI marker (0xFF 0xD9)
+    const int eoiMarker[2] = {0xFF, 0xD9};
+    size_t jpegEnd = 0;
+    for (size_t i = size - 2; i > jpegStart; --i) {
+        if (buf[i] == eoiMarker[0] && buf[i + 1] == eoiMarker[1]) {
+            jpegEnd = i + 2;
+            break;
+        }
+    }
+
+    if (jpegEnd <= jpegStart) {
+        if (error) *error = QStringLiteral("JPEG thumbnail found but EOI marker missing");
+        return QImage();
+    }
+
+    // Extract the JPEG data
+    const QByteArray jpegData = data.mid(static_cast<int>(jpegStart), static_cast<int>(jpegEnd - jpegStart));
+    if (jpegData.size() < 4) {
+        if (error) *error = QStringLiteral("Extracted JPEG data too small");
+        return QImage();
+    }
+
+    QImage img = QImage::fromData(reinterpret_cast<const uchar *>(jpegData.constData()),
+                                  jpegData.size(), "JPEG");
+    if (img.isNull()) {
+        if (error) *error = QStringLiteral("Failed to decode extracted JPEG thumbnail");
+        return QImage();
+    }
+
+    return img;
+}
+
+QImage extractThumbnailWithExifTool(const QString &inputPath, QString *error = nullptr)
+{
+    QString exifTool = QStandardPaths::findExecutable(QStringLiteral("exiftool"));
+    if (exifTool.isEmpty()) {
+        const QString hb1 = QStringLiteral("/opt/homebrew/bin/exiftool");
+        const QString hb2 = QStringLiteral("/usr/local/bin/exiftool");
+        if (QFile::exists(hb1)) {
+            exifTool = hb1;
+        } else if (QFile::exists(hb2)) {
+            exifTool = hb2;
+        } else {
+            logProcessing("extractThumbnailWithExifTool: exiftool not found for %s", inputPath.toUtf8().constData());
+            if (error) *error = QStringLiteral("exiftool not found");
+            return QImage();
+        }
+    }
+    const QStringList tags = {
+        QStringLiteral("-b"),
+        QStringLiteral("-PreviewImage"),
+        inputPath
+    };
+
+    QProcess process;
+    process.start(exifTool, tags);
+    if (!process.waitForFinished(15000) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        const int exitCode = process.exitCode();
+        const QByteArray stdoutOut = process.readAllStandardOutput();
+        const QByteArray stderrOut = process.readAllStandardError();
+        QProcess thumbProcess;
+        thumbProcess.start(exifTool, {QStringLiteral("-b"), QStringLiteral("-ThumbnailImage"), inputPath});
+        if (!thumbProcess.waitForFinished(15000) || thumbProcess.exitStatus() != QProcess::NormalExit || thumbProcess.exitCode() != 0) {
+            const int thumbExit = thumbProcess.exitCode();
+            const QByteArray thumbOut = thumbProcess.readAllStandardOutput();
+            const QByteArray thumbErr = thumbProcess.readAllStandardError();
+            logProcessing("extractThumbnailWithExifTool: exiftool '%s' failed (code=%d, stdout=%zu, stderr_snippet='%s'); fallback failed (code=%d, stdout=%zu, stderr_snippet='%s') for %s",
+                          exifTool.toUtf8().constData(),
+                          exitCode,
+                          static_cast<size_t>(stdoutOut.size()),
+                          QString::fromUtf8(stderrOut).left(200).toUtf8().constData(),
+                          thumbExit,
+                          static_cast<size_t>(thumbOut.size()),
+                          QString::fromUtf8(thumbErr).left(200).toUtf8().constData(),
+                          inputPath.toUtf8().constData());
+            if (error) {
+                *error = QStringLiteral("exiftool failed (code=%1); fallback failed (code=%2)").arg(exitCode).arg(thumbExit);
+            }
+            return QImage();
+        }
+        const QByteArray out = thumbProcess.readAllStandardOutput();
+        QImage img = QImage::fromData(out);
+        if (img.isNull()) {
+            logProcessing("extractThumbnailWithExifTool: exiftool fallback produced data but QImage::fromData failed (bytes=%zu) for %s",
+                          static_cast<size_t>(out.size()), inputPath.toUtf8().constData());
+            if (error) *error = QStringLiteral("exiftool returned data but QImage::fromData failed (fallback)");
+        }
+        return img;
+    }
+
+    const QByteArray out = process.readAllStandardOutput();
+    QImage img = QImage::fromData(out);
+    if (img.isNull()) {
+        logProcessing("extractThumbnailWithExifTool: exiftool produced data but QImage::fromData failed (bytes=%zu) for %s",
+                      static_cast<size_t>(out.size()), inputPath.toUtf8().constData());
+        if (error) *error = QStringLiteral("exiftool returned data but QImage::fromData failed");
+    }
+    return img;
+}
+
+QString findExifToolExecutable()
+{
+    QString exifTool = QStandardPaths::findExecutable(QStringLiteral("exiftool"));
+    if (exifTool.isEmpty()) {
+        const QString hb1 = QStringLiteral("/opt/homebrew/bin/exiftool");
+        const QString hb2 = QStringLiteral("/usr/local/bin/exiftool");
+        if (QFile::exists(hb1)) {
+            exifTool = hb1;
+        } else if (QFile::exists(hb2)) {
+            exifTool = hb2;
+        }
+    }
+    return exifTool;
+}
+
+bool saveDebugPGM(const QString &path, const std::vector<uint16_t> &data, int w, int h)
+{
+    FILE *f = fopen(path.toUtf8().constData(), "wb");
+    if (!f) return false;
+    // PGM P5 header: magic, width, height, max value (65535 for 16-bit)
+    fprintf(f, "P5\n%d %d\n65535\n", w, h);
+    // PGM 16-bit data must be big-endian
+    for (uint16_t val : data) {
+        unsigned char bytes[2];
+        bytes[0] = static_cast<unsigned char>((val >> 8) & 0xFF);
+        bytes[1] = static_cast<unsigned char>(val & 0xFF);
+        fwrite(bytes, 1, 2, f);
+    }
+    fclose(f);
+    return true;
+}
+
+uint16_t planeSampleClamped(const std::vector<uint16_t> &plane,
+                            int planeWidth,
+                            int planeHeight,
+                            int x,
+                            int y)
+{
+    if (planeWidth <= 0 || planeHeight <= 0) {
+        return 0;
+    }
+
+    if (x < 0) {
+        x = 0;
+    } else if (x >= planeWidth) {
+        x = planeWidth - 1;
+    }
+
+    if (y < 0) {
+        y = 0;
+    } else if (y >= planeHeight) {
+        y = planeHeight - 1;
+    }
+
+    return plane[static_cast<size_t>(y) * static_cast<size_t>(planeWidth) +
+                 static_cast<size_t>(x)];
+}
+
+uint16_t averageSamples(const std::vector<uint16_t> &plane,
+                        const std::vector<uint8_t> &mask,
+                        int planeWidth,
+                        int planeHeight,
+                        const int offsets[][2],
+                        int offsetCount,
+                        int x,
+                        int y)
+{
+    uint32_t sum = 0;
+    int count = 0;
+    for (int i = 0; i < offsetCount; ++i) {
+        const int nx = x + offsets[i][0];
+        const int ny = y + offsets[i][1];
+        if (nx < 0 || nx >= planeWidth || ny < 0 || ny >= planeHeight) {
+            continue;
+        }
+        const size_t idx = static_cast<size_t>(ny) * static_cast<size_t>(planeWidth) +
+                           static_cast<size_t>(nx);
+        if (!mask[idx]) {
+            continue;
+        }
+        sum += plane[idx];
+        count++;
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+    return static_cast<uint16_t>((sum + static_cast<uint32_t>(count / 2)) / static_cast<uint32_t>(count));
+}
+
+void fillSparsePlane(std::vector<uint16_t> &plane,
+                     const std::vector<uint8_t> &mask,
+                     int planeWidth,
+                     int planeHeight);
+
+void expandDiagonalPlane(const std::vector<uint16_t> &sourcePlane,
+                         const std::vector<uint8_t> &sourceMask,
+                         int sourceWidth,
+                         int sourceHeight,
+                         int phaseBase,
+                         std::vector<uint16_t> &expandedPlane,
+                         int expandedWidth)
+{
+    expandedPlane.assign(static_cast<size_t>(expandedWidth) * static_cast<size_t>(sourceHeight), 0);
+    std::vector<uint8_t> mask(static_cast<size_t>(expandedWidth) * static_cast<size_t>(sourceHeight), 0);
+
+    for (int y = 0; y < sourceHeight; ++y) {
+        const int phase = ((y & 1) == 0) ? phaseBase : (1 - phaseBase);
+        for (int x = 0; x < sourceWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(sourceWidth) +
+                                  static_cast<size_t>(x);
+            if (!sourceMask.empty() && !sourceMask[srcIdx]) {
+                continue;
+            }
+            const int outX = x * 2 + phase;
+            const size_t dstIdx = static_cast<size_t>(y) * static_cast<size_t>(expandedWidth) +
+                                  static_cast<size_t>(outX);
+            expandedPlane[dstIdx] = sourcePlane[srcIdx];
+            mask[dstIdx] = 1;
+        }
+    }
+
+    const int diagonalOffsets[4][2] = {
+        {-1, -1}, {1, -1}, {-1, 1}, {1, 1}
+    };
+    const int horizontalOffsets[2][2] = {
+        {-1, 0}, {1, 0}
+    };
+    const int verticalOffsets[2][2] = {
+        {0, -1}, {0, 1}
+    };
+
+    for (int y = 0; y < sourceHeight; ++y) {
+        for (int x = 0; x < expandedWidth; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(expandedWidth) +
+                               static_cast<size_t>(x);
+            if (mask[idx]) {
+                continue;
+            }
+
+            uint16_t value = averageSamples(expandedPlane, mask, expandedWidth, sourceHeight,
+                                            horizontalOffsets, 2, x, y);
+            if (value == 0) {
+                value = averageSamples(expandedPlane, mask, expandedWidth, sourceHeight,
+                                       diagonalOffsets, 4, x, y);
+            }
+            if (value == 0) {
+                value = averageSamples(expandedPlane, mask, expandedWidth, sourceHeight,
+                                       verticalOffsets, 2, x, y);
+            }
+            expandedPlane[idx] = value;
+        }
+    }
+}
+
+template <typename T>
+double sampleCompactPhasePlane(const std::vector<T> &plane,
+                               int compactWidth,
+                               int planeHeight,
+                               int phaseBase,
+                               double sx,
+                               double sy)
+{
+    if (compactWidth <= 0 || planeHeight <= 0 || plane.empty()) {
+        return 0.0;
+    }
+
+    sy = std::clamp(sy, 0.0, static_cast<double>(planeHeight - 1));
+    const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, planeHeight - 1);
+    const int y1 = std::clamp(y0 + 1, 0, planeHeight - 1);
+    const double fy = sy - static_cast<double>(y0);
+
+    auto sampleRow = [&](int row) -> double {
+        const int phase = ((row & 1) == 0) ? phaseBase : (1 - phaseBase);
+        double u = (sx - static_cast<double>(phase)) * 0.5;
+        u = std::clamp(u, 0.0, static_cast<double>(compactWidth - 1));
+        const int x0 = std::clamp(static_cast<int>(std::floor(u)), 0, compactWidth - 1);
+        const int x1 = std::clamp(x0 + 1, 0, compactWidth - 1);
+        const double fx = u - static_cast<double>(x0);
+        const double v0 = static_cast<double>(plane[static_cast<size_t>(row) * static_cast<size_t>(compactWidth) +
+                                                     static_cast<size_t>(x0)]);
+        const double v1 = static_cast<double>(plane[static_cast<size_t>(row) * static_cast<size_t>(compactWidth) +
+                                                     static_cast<size_t>(x1)]);
+        return (1.0 - fx) * v0 + fx * v1;
+    };
+
+    const double row0 = sampleRow(y0);
+    const double row1 = sampleRow(y1);
+    return (1.0 - fy) * row0 + fy * row1;
+}
+
+template <typename T>
+double sampleCompactPhasePlaneDirectional(const std::vector<T> &plane,
+                                          int compactWidth,
+                                          int planeHeight,
+                                          int phaseBase,
+                                          double sx,
+                                          double sy,
+                                          bool preferHorizontal)
+{
+    if (compactWidth <= 0 || planeHeight <= 0 || plane.empty()) {
+        return 0.0;
+    }
+
+    sy = std::clamp(sy, 0.0, static_cast<double>(planeHeight - 1));
+    const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, planeHeight - 1);
+    const int y1 = std::clamp(y0 + 1, 0, planeHeight - 1);
+    const double fy = sy - static_cast<double>(y0);
+
+    auto sampleHorizontal = [&](int row) -> double {
+        const int phase = ((row & 1) == 0) ? phaseBase : (1 - phaseBase);
+        double u = (sx - static_cast<double>(phase)) * 0.5;
+        u = std::clamp(u, 0.0, static_cast<double>(compactWidth - 1));
+        const int x0 = std::clamp(static_cast<int>(std::floor(u)), 0, compactWidth - 1);
+        const int x1 = std::clamp(x0 + 1, 0, compactWidth - 1);
+        const double fx = u - static_cast<double>(x0);
+        const double v0 = static_cast<double>(plane[static_cast<size_t>(row) * static_cast<size_t>(compactWidth) +
+                                                     static_cast<size_t>(x0)]);
+        const double v1 = static_cast<double>(plane[static_cast<size_t>(row) * static_cast<size_t>(compactWidth) +
+                                                     static_cast<size_t>(x1)]);
+        return (1.0 - fx) * v0 + fx * v1;
+    };
+
+    if (preferHorizontal || y0 == y1) {
+        const double row0 = sampleHorizontal(y0);
+        const double row1 = sampleHorizontal(y1);
+        return (1.0 - fy) * row0 + fy * row1;
+    }
+
+    const int phase0 = ((y0 & 1) == 0) ? phaseBase : (1 - phaseBase);
+    const int phase1 = ((y1 & 1) == 0) ? phaseBase : (1 - phaseBase);
+    int x0 = static_cast<int>(std::floor((sx - static_cast<double>(phase0)) * 0.5 + 0.5));
+    int x1 = static_cast<int>(std::floor((sx - static_cast<double>(phase1)) * 0.5 + 0.5));
+    x0 = std::clamp(x0, 0, compactWidth - 1);
+    x1 = std::clamp(x1, 0, compactWidth - 1);
+    const double v0 = static_cast<double>(plane[static_cast<size_t>(y0) * static_cast<size_t>(compactWidth) +
+                                                 static_cast<size_t>(x0)]);
+    const double v1 = static_cast<double>(plane[static_cast<size_t>(y1) * static_cast<size_t>(compactWidth) +
+                                                 static_cast<size_t>(x1)]);
+    return (1.0 - fy) * v0 + fy * v1;
+}
+
+std::vector<OffsetScore> deriveSameColorOffsets(const std::vector<uint16_t> &primary,
+                                                const std::vector<uint8_t> &primaryChannels,
+                                                const std::vector<uint16_t> &secondary,
+                                                const std::vector<uint8_t> &secondaryChannels,
+                                                int width,
+                                                int height,
+                                                uint8_t channel,
+                                                int parityClass,
+                                                int radius,
+                                                int topCount)
+{
+    std::vector<OffsetScore> scores;
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+
+            long double sumPrimary = 0.0;
+            long double sumSecondary = 0.0;
+            long double sumPrimary2 = 0.0;
+            long double sumSecondary2 = 0.0;
+            long double sumProduct = 0.0;
+            uint64_t count = 0;
+            for (int y = 0; y < height; ++y) {
+                const int ny = y + dy;
+                if (ny < 0 || ny >= height) {
+                    continue;
+                }
+                for (int x = 0; x < width; ++x) {
+                    const int nx = x + dx;
+                    if (nx < 0 || nx >= width) {
+                        continue;
+                    }
+                    const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                    const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                    if (primary[idx] == 0 || secondary[nidx] == 0) {
+                        continue;
+                    }
+                    const int thisParity = ((y & 1) << 1) | (x & 1);
+                    if (thisParity != parityClass) {
+                        continue;
+                    }
+                    if (primaryChannels[idx] != channel || secondaryChannels[nidx] != channel) {
+                        continue;
+                    }
+                    const uint16_t primarySample = primary[idx];
+                    const uint16_t secondarySample = secondary[nidx];
+                    sumPrimary += primarySample;
+                    sumSecondary += secondarySample;
+                    sumPrimary2 += static_cast<long double>(primarySample) * static_cast<long double>(primarySample);
+                    sumSecondary2 += static_cast<long double>(secondarySample) * static_cast<long double>(secondarySample);
+                    sumProduct += static_cast<long double>(primarySample) * static_cast<long double>(secondarySample);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                OffsetScore score;
+                score.dx = dx;
+                score.dy = dy;
+                score.count = count;
+                if (sumSecondary > 0.0) {
+                    score.gain = static_cast<double>(sumPrimary / sumSecondary);
+                }
+
+                const long double countLd = static_cast<long double>(count);
+                const long double meanPrimary = sumPrimary / countLd;
+                const long double meanSecondary = sumSecondary / countLd;
+                const long double cov = (sumProduct / countLd) - (meanPrimary * meanSecondary);
+                const long double varPrimary = (sumPrimary2 / countLd) - (meanPrimary * meanPrimary);
+                const long double varSecondary = (sumSecondary2 / countLd) - (meanSecondary * meanSecondary);
+                if (varPrimary > 0.0 && varSecondary > 0.0) {
+                    score.corr = static_cast<double>(cov / std::sqrt(varPrimary * varSecondary));
+                }
+
+                long double relErrSum = 0.0;
+                for (int y = 0; y < height; ++y) {
+                    const int ny = y + dy;
+                    if (ny < 0 || ny >= height) {
+                        continue;
+                    }
+                    for (int x = 0; x < width; ++x) {
+                        const int nx = x + dx;
+                        if (nx < 0 || nx >= width) {
+                            continue;
+                        }
+                        const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                        const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                        if (primary[idx] == 0 || secondary[nidx] == 0) {
+                            continue;
+                        }
+                        const int thisParity = ((y & 1) << 1) | (x & 1);
+                        if (thisParity != parityClass) {
+                            continue;
+                        }
+                        if (primaryChannels[idx] != channel || secondaryChannels[nidx] != channel) {
+                            continue;
+                        }
+
+                        const long double primarySample = primary[idx];
+                        const long double mappedSecondary = static_cast<long double>(secondary[nidx]) * score.gain;
+                        const long double denom = primarySample > 1.0 ? primarySample : 1.0;
+                        relErrSum += std::abs(primarySample - mappedSecondary) / denom;
+                    }
+                }
+                score.meanRelativeError = static_cast<double>(relErrSum / countLd);
+                scores.push_back(score);
+            }
+        }
+    }
+
+    std::sort(scores.begin(), scores.end(), [](const OffsetScore &a, const OffsetScore &b) {
+        if (std::abs(a.corr - b.corr) > 1e-9) {
+            return a.corr > b.corr;
+        }
+        if (std::abs(a.meanRelativeError - b.meanRelativeError) > 1e-9) {
+            return a.meanRelativeError < b.meanRelativeError;
+        }
+        if (a.count != b.count) {
+            return a.count > b.count;
+        }
+        const int da = a.dx * a.dx + a.dy * a.dy;
+        const int db = b.dx * b.dx + b.dy * b.dy;
+        return da < db;
+    });
+
+    if (static_cast<int>(scores.size()) > topCount) {
+        scores.resize(static_cast<size_t>(topCount));
+    }
+    return scores;
+}
+
+// Upsample CFA to 2x resolution by interpolation
+// Each original pixel becomes a 2x2 block, creating a full-resolution image
+// where all color positions have valid values
+bool upsampleCfa2x(const std::vector<uint16_t> &cfa,
+                  const std::vector<uint8_t> &channels,
+                  int width,
+                  int height,
+                  std::vector<uint16_t> &upsampled,
+                  std::vector<uint8_t> &upsampledChannels,
+                  int &outWidth,
+                  int &outHeight,
+                  QString &logLabel)
+{
+    outWidth = width * 2;
+    outHeight = height * 2;
+    upsampled.assign(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight), 0);
+    upsampledChannels.assign(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight), 0);
+    
+    // For each original pixel, create a 2x2 block in the output
+    // We use bilinear interpolation from neighboring original pixels
+    superccd::parallel::forRows(height, 8, [&](int y, unsigned) {
+        for (int x = 0; x < width; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            const uint16_t srcValue = cfa[srcIdx];
+            const uint8_t srcChannel = channels[srcIdx];
+            
+            // Destination block: 2x2 pixels
+            // Position (2x, 2y) in output corresponds to (x, y) in input
+            // Each output pixel at (ox, oy) maps back to input (ox/2, oy/2)
+            
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int ox = x * 2 + dx;
+                    const int oy = y * 2 + dy;
+                    const size_t dstIdx = static_cast<size_t>(oy) * static_cast<size_t>(outWidth) + static_cast<size_t>(ox);
+                    
+                    // Set the channel for this upsampled pixel
+                    upsampledChannels[dstIdx] = srcChannel;
+                    
+                    // Interpolate from neighbors with same channel
+                    // Check 4 neighbors at half-pixel offset in the upsampled grid
+                    const int nxOffsets[4] = {-1, 1, 0, 0};
+                    const int nyOffsets[4] = {0, 0, -1, 1};
+                    
+                    uint32_t sum = 0;
+                    int count = 0;
+                    
+                    // Look at the 4 neighboring original pixels (at 2x scale)
+                    for (int i = 0; i < 4; ++i) {
+                        const int nx = x + nxOffsets[i];
+                        const int ny = y + nyOffsets[i];
+                        
+                        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                        
+                        const size_t nIdx = static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                        const uint8_t nChannel = channels[nIdx];
+                        
+                        if (nChannel != srcChannel) continue;  // Must be same color
+                        
+                        const uint16_t nValue = cfa[nIdx];
+                        if (nValue == 0) continue;
+                        
+                        sum += nValue;
+                        count++;
+                    }
+                    
+                    if (count > 0 && srcValue > 0) {
+                        // Average of neighbors plus contribution from original
+                        upsampled[dstIdx] = static_cast<uint16_t>((sum + srcValue) / (count + 1));
+                    } else if (srcValue > 0) {
+                        upsampled[dstIdx] = srcValue;
+                    }
+                }
+            }
+        }
+    });
+    
+    logLabel = QStringLiteral("Upsampled 2x: %1x%2 -> %3x%4").arg(width).arg(height).arg(outWidth).arg(outHeight);
+    return true;
+}
+
+bool interpolateCfaToFullResolution(const std::vector<uint16_t> &cfa,
+                                   const std::vector<uint8_t> &channels,
+                                   int width,
+                                   int height,
+                                   std::vector<uint16_t> &fullRes,
+                                   QString &logLabel)
+{
+    // For each position, if we have a value, keep it
+    // If we don't have a value (different channel originally at that position), 
+    // interpolate from same-color neighbors (respecting CFA pattern)
+    
+    const int dx[4] = {-1, 1, 0, 0};
+    const int dy[4] = {0, 0, -1, 1};
+    
+    fullRes.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+    
+    superccd::parallel::forRows(height, 16, [&](int y, unsigned) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            const uint8_t channel = channels[idx];
+            
+            if (cfa[idx] != 0) {
+                // We have a value at this position
+                fullRes[idx] = cfa[idx];
+            } else {
+                // Need to interpolate from same-color neighbors
+                uint32_t sum = 0;
+                int count = 0;
+                for (int i = 0; i < 4; ++i) {
+                    const int nx = x + dx[i];
+                    const int ny = y + dy[i];
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                    
+                    const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                    if (channels[nidx] != channel) continue;  // Must be same color
+                    if (cfa[nidx] == 0) continue;
+                    
+                    sum += cfa[nidx];
+                    count++;
+                }
+                if (count > 0) {
+                    fullRes[idx] = static_cast<uint16_t>(sum / count);
+                }
+            }
+        }
+    });
+    
+    logLabel = QStringLiteral("Interpolated CFA to full resolution");
+    return true;
+}
+
+bool projectSecondaryOntoPrimary(const std::vector<uint16_t> &primary,
+                                 const std::vector<uint8_t> &primaryChannels,
+                                 const std::vector<uint16_t> &secondary,
+                                 [[maybe_unused]] const std::vector<uint8_t> &secondaryChannels,
+                                 int width,
+                                 int height,
+                                 std::vector<uint16_t> &projected,
+                                 QString &logLabel)
+{
+    Q_UNUSED(primaryChannels);
+    Q_UNUSED(secondaryChannels);
+
+    projected.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+
+    // Simple adjacent pixel sampling - R and S are interleaved in a checkerboard pattern
+    // For each primary pixel, sample the 4 adjacent secondary pixels and average
+    // This avoids boundary artifacts from the offset search method
+    // NOTE: We do NOT check channel matching here because adjacent R and S pixels
+    // naturally have different channels. We rely on the gain estimation to handle this.
+    
+    const int dx[4] = {-1, 1, 0, 0};  // left, right
+    const int dy[4] = {0, 0, -1, 1};  // up, down
+    
+    logLabel = QStringLiteral("Adjacent sampling: use 4-neighbor average (no channel filter)");
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            if (primary[idx] == 0) {
+                continue;
+            }
+
+            // Collect all adjacent secondary pixels (any channel)
+            // The gain estimation will handle channel mismatches
+            uint32_t sum = 0;
+            int count = 0;
+            for (int i = 0; i < 4; ++i) {
+                const int nx = x + dx[i];
+                const int ny = y + dy[i];
+                if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+                    continue;
+                }
+                const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                const uint16_t sample = secondary[nidx];
+                if (sample == 0) {
+                    continue;
+                }
+                sum += sample;
+                count++;
+            }
+
+            if (count > 0) {
+                projected[idx] = static_cast<uint16_t>(sum / count);
+            }
+        }
+    }
+
+    return true;
+}
+
+void estimateProjectedGain(const std::vector<uint16_t> &primary,
+                           const std::vector<uint8_t> &primaryChannels,
+                           const std::vector<uint16_t> &projectedSecondary,
+                           int width,
+                           int height,
+                           double gains[4],
+                           QString &logLabel)
+{
+    Q_UNUSED(width);
+    Q_UNUSED(height);
+
+    long double sumPrimary[4] = {0.0, 0.0, 0.0, 0.0};
+    long double sumSecondary[4] = {0.0, 0.0, 0.0, 0.0};
+    uint16_t maxPrimary[4] = {0, 0, 0, 0};
+
+    const size_t pixelCount = primary.size();
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const uint8_t channel = primaryChannels[i];
+        if (channel > 3) {
+            continue;
+        }
+        if (primary[i] > maxPrimary[channel]) {
+            maxPrimary[channel] = primary[i];
+        }
+    }
+
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const uint8_t channel = primaryChannels[i];
+        if (channel > 3) {
+            continue;
+        }
+        const uint16_t s = primary[i];
+        const uint16_t r = projectedSecondary[i];
+        if (s == 0 || r == 0) {
+            continue;
+        }
+
+        const double white = maxPrimary[channel] > 0 ? static_cast<double>(maxPrimary[channel]) : 1.0;
+        const double normalized = static_cast<double>(s) / white;
+        // Include highlight pixels (up to 0.95) in gain estimation so gains better
+        // reflect R/S relationship in highlight areas where blending matters most
+        if (normalized < 0.10 || normalized > 0.95) {
+            continue;
+        }
+
+        sumPrimary[channel] += s;
+        sumSecondary[channel] += r;
+    }
+
+    logLabel.clear();
+    for (int channel = 0; channel < 4; ++channel) {
+        gains[channel] = sumSecondary[channel] > 0.0
+                             ? static_cast<double>(sumPrimary[channel] / sumSecondary[channel])
+                             : 1.0;
+        logLabel += QStringLiteral("ch%1 gain=%2 white=%3 ")
+                        .arg(channel)
+                        .arg(gains[channel], 0, 'f', 5)
+                        .arg(maxPrimary[channel]);
+    }
+}
+
+// Advanced noise reduction for the R (secondary) CFA plane.
+//
+// Applies two independent filters:
+//   1. Luma NR:  edge-aware bilateral smoothing that preserves luminance edges
+//      while reducing grain.  Uses variance-adaptive range sigma so flat
+//      areas get stronger smoothing than edge regions.
+//   2. Color NR: chroma noise suppression via soft-thresholding of pixel
+//      deviations from local mean.  At CFA level, "color noise" manifests
+//      as random high-frequency pixel-to-pixel variations that become
+//      chroma artifacts after demosaicing.  We estimate local mean using
+//      spatial weights only (no range weighting), compute deviation, and
+//      apply a soft threshold: small deviations (noise) are suppressed,
+//      large deviations (detail/edges) are preserved.  This targets color
+//      noise without blurring luminance structure.
+//
+// Both filters operate on same-channel CFA neighbors at stride 2 within
+// a configurable radius, using pre-computed Gaussian spatial weights.
+//
+// The strength parameter (0..1) controls:
+//   - Luma NR: range sigma and blend factor
+//   - Color NR: soft threshold value (larger = more aggressive noise suppression)
+//
+// A luminance-dependent activity curve reduces NR in deep shadows
+// (where signal is unreliable) and specular highlights (already flat).
+static void applyRPlaneNoiseReduction(std::vector<uint16_t> &rPlane,
+                                      const std::vector<uint8_t> &channels,
+                                      int width,
+                                      int height,
+                                      double lumaNR)    // 0..1
+{
+    if (lumaNR <= 0.0) {
+        return;
+    }
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    if (rPlane.size() != pixelCount || channels.size() != pixelCount) {
+        return;
+    }
+
+    const double lumaStrength = std::clamp(lumaNR, 0.0, 1.0);
+
+    // Estimate white reference from the R plane for sigma normalization.
+    uint16_t maxVal = 0;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if (rPlane[i] > maxVal) {
+            maxVal = rPlane[i];
+        }
+    }
+    const double whiteRef = maxVal > 0 ? static_cast<double>(maxVal) : 1.0;
+
+    // Range sigma for luma NR: controls edge preservation sensitivity.
+    // At strength 0.01 the sigma is very small (almost no smoothing),
+    // at strength 1.0 the sigma is large (aggressive smoothing).
+    const double lumaSigma = (0.002 + lumaStrength * 0.148) * whiteRef;
+    const double lumaInv2Sigma2 = 1.0 / (2.0 * lumaSigma * lumaSigma + 1e-12);
+
+    // Spatial kernel: radius 2 in CFA stride-2 coordinates gives up to
+    // 24 same-channel neighbors in a 5x5 CFA window.
+    constexpr int kRadius = 2;
+    constexpr double kSpatialSigma = 1.5;
+    constexpr double kSpatialInv2Sigma2 = 1.0 / (2.0 * kSpatialSigma * kSpatialSigma);
+
+    // Pre-compute spatial weight table for offsets in stride-2 CFA grid.
+    struct NeighborOffset {
+        int dx;           // pixel-space offset (already *2)
+        int dy;
+        double spatialW;  // pre-computed Gaussian spatial weight
+    };
+    std::array<NeighborOffset, 24> offsets;
+    int nOffsets = 0;
+    for (int dy = -kRadius; dy <= kRadius; ++dy) {
+        for (int dx = -kRadius; dx <= kRadius; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            const double dist2 = static_cast<double>(dx * dx + dy * dy);
+            const double sw = std::exp(-dist2 * kSpatialInv2Sigma2);
+            offsets[static_cast<size_t>(nOffsets++)] = {dx * 2, dy * 2, sw};
+        }
+    }
+
+    std::vector<uint16_t> output(rPlane);
+
+    // Process in parallel by horizontal bands.
+    superccd::parallel::forRanges(
+        0, height, 64,
+        [&](std::size_t yBegin, std::size_t yEnd, unsigned) {
+            for (int y = static_cast<int>(yBegin); y < static_cast<int>(yEnd); ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const size_t idx = static_cast<size_t>(y) * width + x;
+                    const uint8_t ch = channels[idx];
+                    if (ch > 3 || rPlane[idx] == 0) {
+                        output[idx] = rPlane[idx];
+                        continue;
+                    }
+
+                    const double centerVal = static_cast<double>(rPlane[idx]);
+
+                    // Luminance-dependent activity curve: reduce NR effect
+                    // in deep shadows (< 3% of white) and specular highlights
+                    // (> 90% of white) where it's less useful or harmful.
+                    const double normalizedLuma = centerVal / whiteRef;
+                    double activity = 1.0;
+                    if (normalizedLuma < 0.03) {
+                        activity = normalizedLuma / 0.03;
+                        activity = activity * activity * (3.0 - 2.0 * activity);
+                    } else if (normalizedLuma > 0.90) {
+                        const double t = (normalizedLuma - 0.90) / 0.10;
+                        activity = 1.0 - t * t * (3.0 - 2.0 * t);
+                    }
+
+                    if (activity < 0.01) {
+                        output[idx] = rPlane[idx];
+                        continue;
+                    }
+
+                    double lumaSum = 0.0;
+                    double lumaWeightSum = 0.0;
+
+                    for (int k = 0; k < nOffsets; ++k) {
+                        const int nx = x + offsets[k].dx;
+                        const int ny = y + offsets[k].dy;
+                        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+                            continue;
+                        }
+                        const size_t nidx = static_cast<size_t>(ny) * width + nx;
+                        if (channels[nidx] != ch || rPlane[nidx] == 0) {
+                            continue;
+                        }
+
+                        const double nVal = static_cast<double>(rPlane[nidx]);
+                        const double diff = centerVal - nVal;
+                        const double diff2 = diff * diff;
+                        const double sw = offsets[k].spatialW;
+
+                        // Bilateral filter with range weighting
+                        const double rangeW = std::exp(-diff2 * lumaInv2Sigma2);
+                        const double w = sw * rangeW;
+                        lumaSum += nVal * w;
+                        lumaWeightSum += w;
+                    }
+
+                    double result = centerVal;
+
+                    // Apply luma NR: blend original toward bilateral-smoothed value.
+                    if (lumaWeightSum > 1e-12) {
+                        const double smoothed = lumaSum / lumaWeightSum;
+                        const double blend = std::sqrt(lumaStrength) * activity;
+                        result = (1.0 - blend) * centerVal + blend * smoothed;
+                    }
+
+                    output[idx] = static_cast<uint16_t>(
+                        std::clamp<int>(static_cast<int>(result + 0.5), 0, 65535));
+                }
+            }
+        });
+
+    rPlane = std::move(output);
+}
+
+void mergePrimaryAndProjectedSecondary(const std::vector<uint16_t> &primary,
+                                       const std::vector<uint8_t> &primaryChannels,
+                                       const std::vector<uint16_t> &projectedSecondary,
+                                       int width,
+                                       int height,
+                                       double rHeadroomScale,
+                                       double rTransitionStart,
+                                       double rTransitionDelay,
+                                       double rTransitionSmoothness,
+                                       double rLumaNoiseReduction,
+                                       bool sDrivenHighlightsOnly,
+                                       std::vector<uint16_t> &merged,
+                                       QString &logLabel,
+                                       double *appliedOutputScale = nullptr)
+{
+    merged.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+    const size_t pixelCount = primary.size();
+
+    // Apply noise reduction to a mutable copy of the R plane when requested.
+    std::vector<uint16_t> denoisedR = projectedSecondary;
+    if (rLumaNoiseReduction > 0.0) {
+        applyRPlaneNoiseReduction(denoisedR, primaryChannels, width, height,
+                                  rLumaNoiseReduction);
+    }
+
+    std::vector<double> desired(pixelCount, 0.0);
+
+    double gains[4] = {1.0, 1.0, 1.0, 1.0};
+    QString gainSummary;
+    estimateProjectedGain(primary, primaryChannels, projectedSecondary, width, height, gains, gainSummary);
+
+    uint16_t maxPrimary[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const uint8_t channel = primaryChannels[i];
+        if (channel > 3) {
+            continue;
+        }
+        if (primary[i] > maxPrimary[channel]) {
+            maxPrimary[channel] = primary[i];
+        }
+    }
+
+    uint64_t blendedCount = 0;
+    uint64_t replacedCount = 0;
+    double maxDesired = 0.0;
+    std::mutex mergeStatsMutex;
+    superccd::parallel::forRanges(
+        0,
+        pixelCount,
+        131072,
+        [&](size_t begin, size_t end, unsigned) {
+            uint64_t localBlendedCount = 0;
+            uint64_t localReplacedCount = 0;
+            double localMaxDesired = 0.0;
+            for (size_t i = begin; i < end; ++i) {
+                const uint8_t channel = primaryChannels[i];
+                const uint16_t s = primary[i];
+                if (channel > 3 || s == 0) {
+                    continue;
+                }
+
+                const uint16_t rProjected = denoisedR[i];
+                if (rProjected == 0) {
+                    merged[i] = s;
+                    desired[i] = static_cast<double>(s);
+                    continue;
+                }
+
+                const double white = maxPrimary[channel] > 0 ? static_cast<double>(maxPrimary[channel]) : 1.0;
+                const double scaledS = static_cast<double>(s);
+                const double normalizedS = static_cast<double>(s) / white;
+                const double normalizedR = white > 0 ? static_cast<double>(rProjected) / white : 0.0;
+
+                // Detect S clipping: when S is very bright but R is disproportionately dark,
+                // R is likely more accurate (S may be clipping in highlight areas)
+                // Also require rProjected > 200 to ensure the R projection itself is reliable
+                // TEMPORARILY DISABLED - conditions were too aggressive, causing artifacts
+                const bool sMayBeClipping =
+                    false && (normalizedS > 0.70) && (normalizedR < 0.05) && (rProjected > 200);
+
+                double scaledR;
+                if (sMayBeClipping) {
+                    // R is more reliable in extreme highlights; use R without gain boost
+                    scaledR = static_cast<double>(rProjected);
+                } else {
+                    scaledR = static_cast<double>(rProjected) * gains[channel];
+                }
+                const double start = std::clamp(rTransitionStart, 0.0, 1.0);
+                // "Delay" is now the width of the S->R transition in
+                // normalized S units. Cap it so the end never leaves the
+                // valid [0, 1] S-brightness range.
+                const double delayWidth = std::clamp(rTransitionDelay, 0.0, 1.0);
+                const double smoothness = std::clamp(rTransitionSmoothness, 0.0, 1.0);
+                double blendStart = 0.95;
+                double blendEnd = 1.02;
+                // blendScale fades the final blendT to 0 in the very
+                // last fraction of the Merge start slider (start in
+                // [0.9985, 1.0]). Without this, moving the slider from
+                // 99 to 100 is a binary jump from "all clipped pixels
+                // get R" to "no clipped pixels get R". With it, the
+                // amount of R blended into the brightest pixels
+                // gradually decreases from 100% (at start = 0.9985) to
+                // 0% (at start = 1.0).
+                double blendScale = 1.0;
+                if (!sDrivenHighlightsOnly) {
+                    // Map the slider 0..1 onto a usable width 0..0.4.
+                    // The 0.4 cap means even at the maximum the end of
+                    // the transition is start + 0.4 (so start must be
+                    // <= 0.6 for end to reach 1.0; otherwise end clamps
+                    // at 1.0).
+                    constexpr double kMergeStartFullWidthCeiling = 0.9985;
+                    constexpr double kMaxWidth = 0.40;
+                    if (start > kMergeStartFullWidthCeiling) {
+                        const double u = (start - kMergeStartFullWidthCeiling)
+                                         / (1.0 - kMergeStartFullWidthCeiling);
+                        // smoothstep: 0 at start=0.9985, 1 at start=1.0
+                        const double smoothU = u * u * (3.0 - 2.0 * u);
+                        blendScale = 1.0 - smoothU;
+                    }
+                    if (blendScale < 1e-6) {
+                        // Defensive: a 0 scale means "no merge at all"
+                        // -> pure S for every pixel.
+                        blendStart = 1.0;
+                        blendEnd = 1.0;
+                    } else {
+                        const double width = kMaxWidth * delayWidth;
+                        // Clamp blendStart to [0, 1.0). Then the window
+                        // is [blendStart, min(1.0, blendStart + width)].
+                        // We never use std::clamp with lo > hi here, so
+                        // the result is always well-defined and blendEnd
+                        // is always <= 1.0 (so the blend reaches 1.0 at
+                        // S=1.0, i.e. clipped highlights become pure R).
+                        blendStart = std::clamp(start, 0.0, 1.0);
+                        const double requestedEnd = blendStart + width;
+                        blendEnd = std::min(requestedEnd, 1.0);
+                        // Ensure a tiny minimum window so the math is
+                        // stable (avoid div-by-zero on blendEnd - blendStart).
+                        if (blendEnd - blendStart < 1e-6) {
+                            blendStart = 1.0;
+                            blendEnd = 1.0;
+                        }
+                    }
+                }
+
+                if (normalizedS <= blendStart) {
+                    merged[i] = static_cast<uint16_t>(
+                        std::clamp<int>(static_cast<int>(scaledS + 0.5), 0, 65535));
+                    desired[i] = scaledS;
+                    continue;
+                }
+
+                if (normalizedS >= blendEnd) {
+                    // Apply the fade-out scale here too: in the very
+                    // last fraction of the Merge start slider the R
+                    // contribution is gradually reduced to 0, so the
+                    // transition from "full R recovery" to "no R at
+                    // all" is smooth.
+                    const double rBlend = scaledR * blendScale
+                                          + scaledS * (1.0 - blendScale);
+                    merged[i] = static_cast<uint16_t>(
+                        std::clamp<int>(static_cast<int>(rBlend + 0.5), 0, 65535));
+                    desired[i] = rBlend;
+                    localReplacedCount++;
+                    localMaxDesired = std::max(localMaxDesired, rBlend);
+                    continue;
+                }
+
+                const double t = (normalizedS - blendStart) / (blendEnd - blendStart);
+                // t == 0 at the merge start, t == 1 at the R-only end.
+                const double smoothT = t * t * (3.0 - 2.0 * t);
+                // Ease-in / exponential shape: blendT = t ^ k, with
+                // k = exp(GAMMA * smoothness). smoothness=0 -> k=1 (straight
+                // line), smoothness=1 -> k~exp(2.0)~7.4 (sharp ~90deg).
+                constexpr double kEaseInGamma = 2.0;
+                const double easeInT = std::pow(std::max(t, 0.0), std::exp(kEaseInGamma * smoothness));
+                const double baseBlendT = sDrivenHighlightsOnly
+                                        ? smoothT
+                                        : easeInT;
+                // Apply the fade-out scale: in the very last fraction
+                // of the Merge start slider (start in [0.9985, 1.0])
+                // the blend is gradually reduced to 0, so the
+                // transition from "full R recovery" to "no R at all"
+                // is smooth instead of a binary jump.
+                const double blendT = baseBlendT * blendScale;
+                const double mergedValue = (1.0 - blendT) * scaledS + blendT * scaledR;
+                desired[i] = mergedValue;
+                merged[i] = static_cast<uint16_t>(
+                    std::clamp<int>(static_cast<int>(mergedValue + 0.5), 0, 65535));
+                localBlendedCount++;
+                localMaxDesired = std::max(localMaxDesired, mergedValue);
+            }
+
+            const std::lock_guard<std::mutex> lock(mergeStatsMutex);
+            blendedCount += localBlendedCount;
+            replacedCount += localReplacedCount;
+            maxDesired = std::max(maxDesired, localMaxDesired);
+        });
+
+    double outputScale = 1.0;
+    if (maxDesired > 65535.0) {
+        outputScale = 65535.0 / maxDesired;
+    }
+    outputScale *= rHeadroomScale;
+    if (outputScale < 1.0) {
+        superccd::parallel::forRanges(
+            0,
+            pixelCount,
+            131072,
+            [&](size_t begin, size_t end, unsigned) {
+                for (size_t i = begin; i < end; ++i) {
+                    if (desired[i] <= 0.0) {
+                        merged[i] = 0;
+                        continue;
+                    }
+                    const double outputValue = desired[i] * outputScale;
+                    merged[i] = static_cast<uint16_t>(
+                        std::clamp<int>(static_cast<int>(outputValue + 0.5), 0, 65535));
+                }
+            });
+    }
+
+    if (appliedOutputScale) {
+        *appliedOutputScale = outputScale;
+    }
+
+    logLabel = QStringLiteral("%1userScale=%2 start=%3 width=%4 smoothness=%5 maxDesired=%6 outputScale=%7 highlightsOnly=%8 blended=%9 replaced=%10")
+                   .arg(gainSummary)
+                   .arg(rHeadroomScale, 0, 'f', 3)
+                   .arg(rTransitionStart, 0, 'f', 3)
+                   .arg(rTransitionDelay, 0, 'f', 3)
+                   .arg(rTransitionSmoothness, 0, 'f', 3)
+                   .arg(maxDesired, 0, 'f', 2)
+                   .arg(outputScale, 0, 'f', 6)
+                   .arg(sDrivenHighlightsOnly ? 1 : 0)
+                   .arg(static_cast<qulonglong>(blendedCount))
+                   .arg(static_cast<qulonglong>(replacedCount));
+}
+
+void suppressPreviewFalseColor(std::vector<float> &rgb, int width, int height)
+{
+    if (width < 3 || height < 3 ||
+        rgb.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 3) {
+        return;
+    }
+
+    const std::vector<float> source = rgb;
+    static constexpr int spatialWeights[5] = {1, 2, 3, 2, 1};
+
+    superccd::parallel::forRows(height, 8, [&](int y, unsigned) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            const float centerG = source[idx * 3 + 1];
+            const float centerDr = source[idx * 3 + 0] - centerG;
+            const float centerDb = source[idx * 3 + 2] - centerG;
+            const float edgeThreshold = std::max(512.0f, centerG * 0.025f);
+
+            double sumDr = 0.0;
+            double sumDb = 0.0;
+            double sumWeight = 0.0;
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int ny = std::clamp(y + dy, 0, height - 1);
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int nx = std::clamp(x + dx, 0, width - 1);
+                    const size_t neighborIdx =
+                        static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx);
+                    const float neighborG = source[neighborIdx * 3 + 1];
+                    if (std::abs(neighborG - centerG) > edgeThreshold) {
+                        continue;
+                    }
+
+                    const double weight =
+                        static_cast<double>(spatialWeights[dx + 2] * spatialWeights[dy + 2]);
+                    sumDr += static_cast<double>(source[neighborIdx * 3 + 0] - neighborG) * weight;
+                    sumDb += static_cast<double>(source[neighborIdx * 3 + 2] - neighborG) * weight;
+                    sumWeight += weight;
+                }
+            }
+
+            if (sumWeight <= 0.0) {
+                continue;
+            }
+
+            const float filteredDr = static_cast<float>(sumDr / sumWeight);
+            const float filteredDb = static_cast<float>(sumDb / sumWeight);
+            const float chromaDeviation =
+                std::max(std::abs(centerDr - filteredDr), std::abs(centerDb - filteredDb));
+            const float artifactThreshold = std::max(256.0f, centerG * 0.02f);
+            const float artifactStrength =
+                std::clamp(chromaDeviation / artifactThreshold, 0.0f, 1.0f);
+            const float strength = 0.55f + artifactStrength * 0.4f;
+            const float mixedDr = centerDr + (filteredDr - centerDr) * strength;
+            const float mixedDb = centerDb + (filteredDb - centerDb) * strength;
+
+            rgb[idx * 3 + 0] = std::clamp(centerG + mixedDr, 0.0f, 65535.0f);
+            rgb[idx * 3 + 2] = std::clamp(centerG + mixedDb, 0.0f, 65535.0f);
+        }
+    });
+}
+
+bool buildPreviewImageFromCfa(const std::vector<uint16_t> &cfa,
+                              int width,
+                              int height,
+                              const SuperCCDMetadata &metadata,
+                              int maxSize,
+                              int previewRotation,
+                              double toneContrast,
+                              QImage &preview,
+                              QString &error)
+{
+    const size_t sourcePixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (width < 2 || height < 2 || cfa.size() < sourcePixelCount) {
+        error = QStringLiteral("Invalid CFA data for preview.");
+        return false;
+    }
+
+    enum class CfaColor { Red, Green, Blue };
+    auto colorAt = [](int x, int y) -> CfaColor {
+        if ((y & 1) == 0) {
+            return (x & 1) == 0 ? CfaColor::Green : CfaColor::Blue;
+        }
+        return (x & 1) == 0 ? CfaColor::Red : CfaColor::Green;
+    };
+    const float greenBlack = metadata.hasBlackLevels
+        ? static_cast<float>((metadata.blackLevels[0] + metadata.blackLevels[3]) * 0.5)
+        : 0.0f;
+    const float blueBlack = metadata.hasBlackLevels
+        ? static_cast<float>(metadata.blackLevels[1])
+        : 0.0f;
+    const float redBlack = metadata.hasBlackLevels
+        ? static_cast<float>(metadata.blackLevels[2])
+        : 0.0f;
+    auto blackLevelForColor = [&](CfaColor color) -> float {
+        switch (color) {
+        case CfaColor::Red:
+            return redBlack;
+        case CfaColor::Blue:
+            return blueBlack;
+        case CfaColor::Green:
+            return greenBlack;
+        }
+        return 0.0f;
+    };
+
+    auto sample = [&](int x, int y) -> float {
+        x = std::clamp(x, 0, width - 1);
+        y = std::clamp(y, 0, height - 1);
+        const float rawValue = static_cast<float>(
+            cfa[static_cast<size_t>(y) * static_cast<size_t>(width)
+                + static_cast<size_t>(x)]);
+        return std::max(0.0f, rawValue - blackLevelForColor(colorAt(x, y)));
+    };
+
+    // Green carries most edge detail. Reconstruct it first along the smoother
+    // direction so red/blue can be interpolated as color differences instead
+    // of as unrelated intensity planes.
+    std::vector<float> green(sourcePixelCount, 0.0f);
+    superccd::parallel::forRows(height, 8, [&](int y, unsigned) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            const float center = sample(x, y);
+            if (colorAt(x, y) == CfaColor::Green) {
+                green[idx] = center;
+                continue;
+            }
+
+            bool haveHorizontal = x > 0 && x + 1 < width;
+            bool haveVertical = y > 0 && y + 1 < height;
+            float horizontal = 0.0f;
+            float vertical = 0.0f;
+            float gradientHorizontal = 0.0f;
+            float gradientVertical = 0.0f;
+
+            if (haveHorizontal) {
+                const float left = sample(x - 1, y);
+                const float right = sample(x + 1, y);
+                horizontal = (left + right) * 0.5f;
+                gradientHorizontal = std::abs(left - right);
+                if (x > 1 && x + 2 < width) {
+                    const float left2 = sample(x - 2, y);
+                    const float right2 = sample(x + 2, y);
+                    horizontal += (2.0f * center - left2 - right2) * 0.25f;
+                    horizontal = std::clamp(horizontal, std::min(left, right), std::max(left, right));
+                    gradientHorizontal += std::abs(2.0f * center - left2 - right2);
+                }
+            }
+            if (haveVertical) {
+                const float up = sample(x, y - 1);
+                const float down = sample(x, y + 1);
+                vertical = (up + down) * 0.5f;
+                gradientVertical = std::abs(up - down);
+                if (y > 1 && y + 2 < height) {
+                    const float up2 = sample(x, y - 2);
+                    const float down2 = sample(x, y + 2);
+                    vertical += (2.0f * center - up2 - down2) * 0.25f;
+                    vertical = std::clamp(vertical, std::min(up, down), std::max(up, down));
+                    gradientVertical += std::abs(2.0f * center - up2 - down2);
+                }
+            }
+
+            if (haveHorizontal && haveVertical) {
+                if (gradientHorizontal < gradientVertical) {
+                    green[idx] = horizontal;
+                } else if (gradientVertical < gradientHorizontal) {
+                    green[idx] = vertical;
+                } else {
+                    green[idx] = (horizontal + vertical) * 0.5f;
+                }
+            } else if (haveHorizontal) {
+                green[idx] = horizontal;
+            } else if (haveVertical) {
+                green[idx] = vertical;
+            } else {
+                float sum = 0.0f;
+                int count = 0;
+                if (x > 0) {
+                    sum += sample(x - 1, y);
+                    ++count;
+                }
+                if (x + 1 < width) {
+                    sum += sample(x + 1, y);
+                    ++count;
+                }
+                if (y > 0) {
+                    sum += sample(x, y - 1);
+                    ++count;
+                }
+                if (y + 1 < height) {
+                    sum += sample(x, y + 1);
+                    ++count;
+                }
+                green[idx] = count > 0 ? sum / static_cast<float>(count) : center;
+            }
+        }
+    });
+
+    const int fujiWidth = metadata.fujiWidth > 0 ? metadata.fujiWidth : width / 2;
+    const int rectWidth = fujiWidth * 2 + 1;
+    const int rectHeight = (height - fujiWidth) * 2 + 1;
+    if (rectWidth <= 0 || rectHeight <= 0) {
+        error = QStringLiteral("Invalid Fuji preview geometry.");
+        return false;
+    }
+
+    const size_t rectPixelCount = static_cast<size_t>(rectWidth) * static_cast<size_t>(rectHeight);
+    std::vector<float> rectifiedRgb;
+    std::vector<uint8_t> rectifiedMask;
+    try {
+        rectifiedRgb.assign(rectPixelCount * 3, 0.0f);
+        rectifiedMask.assign(rectPixelCount, 0);
+    } catch (const std::bad_alloc &) {
+        error = QStringLiteral("Failed to allocate rectified preview image.");
+        return false;
+    }
+
+    auto greenAt = [&](int x, int y) -> float {
+        x = std::clamp(x, 0, width - 1);
+        y = std::clamp(y, 0, height - 1);
+        return green[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)];
+    };
+    auto axisColorDifference = [&](int x, int y, int dx, int dy) -> float {
+        float sum = 0.0f;
+        int count = 0;
+        const int x0 = x - dx;
+        const int y0 = y - dy;
+        if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
+            sum += sample(x0, y0) - greenAt(x0, y0);
+            ++count;
+        }
+        const int x1 = x + dx;
+        const int y1 = y + dy;
+        if (x1 >= 0 && x1 < width && y1 >= 0 && y1 < height) {
+            sum += sample(x1, y1) - greenAt(x1, y1);
+            ++count;
+        }
+        return count > 0 ? sum / static_cast<float>(count) : 0.0f;
+    };
+    auto diagonalColorDifference = [&](int x, int y) -> float {
+        const bool haveBackslash = x > 0 && x + 1 < width && y > 0 && y + 1 < height;
+        const bool haveSlash = x > 0 && x + 1 < width && y > 0 && y + 1 < height;
+        if (haveBackslash && haveSlash) {
+            const float nw = sample(x - 1, y - 1);
+            const float se = sample(x + 1, y + 1);
+            const float ne = sample(x + 1, y - 1);
+            const float sw = sample(x - 1, y + 1);
+            const float backslash = ((nw - greenAt(x - 1, y - 1)) +
+                                     (se - greenAt(x + 1, y + 1))) * 0.5f;
+            const float slash = ((ne - greenAt(x + 1, y - 1)) +
+                                 (sw - greenAt(x - 1, y + 1))) * 0.5f;
+            const float gradientBackslash = std::abs(nw - se) +
+                                            std::abs(greenAt(x - 1, y - 1) - greenAt(x + 1, y + 1));
+            const float gradientSlash = std::abs(ne - sw) +
+                                        std::abs(greenAt(x + 1, y - 1) - greenAt(x - 1, y + 1));
+            if (gradientBackslash < gradientSlash) {
+                return backslash;
+            }
+            if (gradientSlash < gradientBackslash) {
+                return slash;
+            }
+            return (backslash + slash) * 0.5f;
+        }
+
+        float sum = 0.0f;
+        int count = 0;
+        for (int dy = -1; dy <= 1; dy += 2) {
+            for (int dx = -1; dx <= 1; dx += 2) {
+                const int nx = x + dx;
+                const int ny = y + dy;
+                if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+                    continue;
+                }
+                sum += sample(nx, ny) - greenAt(nx, ny);
+                ++count;
+            }
+        }
+        return count > 0 ? sum / static_cast<float>(count) : 0.0f;
+    };
+    auto demosaicPixel = [&](int x, int y, float &r, float &g, float &b) {
+        const float center = sample(x, y);
+        g = greenAt(x, y);
+        switch (colorAt(x, y)) {
+        case CfaColor::Red:
+            r = center;
+            b = g + diagonalColorDifference(x, y);
+            break;
+        case CfaColor::Blue:
+            b = center;
+            r = g + diagonalColorDifference(x, y);
+            break;
+        case CfaColor::Green:
+            if ((y & 1) == 0) {
+                b = g + axisColorDifference(x, y, 1, 0);
+                r = g + axisColorDifference(x, y, 0, 1);
+            } else {
+                r = g + axisColorDifference(x, y, 1, 0);
+                b = g + axisColorDifference(x, y, 0, 1);
+            }
+            break;
+        }
+        r = std::clamp(r, 0.0f, 65535.0f);
+        g = std::clamp(g, 0.0f, 65535.0f);
+        b = std::clamp(b, 0.0f, 65535.0f);
+    };
+
+    superccd::parallel::forRows(height, 8, [&](int row, unsigned) {
+        const int start = std::abs(fujiWidth - row);
+        const int end = std::min({width, rectHeight + fujiWidth - row, rectWidth - fujiWidth + row});
+        for (int col = start; col < end; ++col) {
+            const int y = row + col - fujiWidth;
+            const int x = fujiWidth - row + col;
+            if (x >= 0 && x < rectWidth && y >= 0 && y < rectHeight) {
+                const size_t rectIdx = static_cast<size_t>(y) * static_cast<size_t>(rectWidth) + static_cast<size_t>(x);
+                float r = 0.0f;
+                float g = 0.0f;
+                float b = 0.0f;
+                demosaicPixel(col, row, r, g, b);
+                rectifiedRgb[rectIdx * 3 + 0] = r;
+                rectifiedRgb[rectIdx * 3 + 1] = g;
+                rectifiedRgb[rectIdx * 3 + 2] = b;
+                rectifiedMask[rectIdx] = 1;
+            }
+        }
+    });
+
+    // The diagonal sensor mapping leaves a checkerboard of gaps. Fill those
+    // before tone mapping, using the direction with the smallest green edge.
+    superccd::parallel::forRows(rectHeight, 8, [&](int y, unsigned) {
+        for (int x = 0; x < rectWidth; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(rectWidth) + static_cast<size_t>(x);
+            if (rectifiedMask[idx]) {
+                continue;
+            }
+
+            const bool haveLeft = x > 0 && rectifiedMask[idx - 1];
+            const bool haveRight = x + 1 < rectWidth && rectifiedMask[idx + 1];
+            const bool haveUp = y > 0 && rectifiedMask[idx - static_cast<size_t>(rectWidth)];
+            const bool haveDown = y + 1 < rectHeight && rectifiedMask[idx + static_cast<size_t>(rectWidth)];
+            const bool haveHorizontal = haveLeft && haveRight;
+            const bool haveVertical = haveUp && haveDown;
+
+            if (haveHorizontal || haveVertical) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    float horizontal = 0.0f;
+                    float vertical = 0.0f;
+                    if (haveHorizontal) {
+                        horizontal = (rectifiedRgb[(idx - 1) * 3 + static_cast<size_t>(channel)] +
+                                      rectifiedRgb[(idx + 1) * 3 + static_cast<size_t>(channel)]) * 0.5f;
+                    }
+                    if (haveVertical) {
+                        vertical = (rectifiedRgb[(idx - static_cast<size_t>(rectWidth)) * 3 + static_cast<size_t>(channel)] +
+                                    rectifiedRgb[(idx + static_cast<size_t>(rectWidth)) * 3 + static_cast<size_t>(channel)]) * 0.5f;
+                    }
+
+                    if (haveHorizontal && haveVertical) {
+                        const float gradientHorizontal =
+                            std::abs(rectifiedRgb[(idx - 1) * 3 + 1] - rectifiedRgb[(idx + 1) * 3 + 1]);
+                        const float gradientVertical =
+                            std::abs(rectifiedRgb[(idx - static_cast<size_t>(rectWidth)) * 3 + 1] -
+                                     rectifiedRgb[(idx + static_cast<size_t>(rectWidth)) * 3 + 1]);
+                        const float horizontalWeight = 1.0f / (1.0f + gradientHorizontal);
+                        const float verticalWeight = 1.0f / (1.0f + gradientVertical);
+                        rectifiedRgb[idx * 3 + static_cast<size_t>(channel)] =
+                            (horizontal * horizontalWeight + vertical * verticalWeight) /
+                            (horizontalWeight + verticalWeight);
+                    } else {
+                        rectifiedRgb[idx * 3 + static_cast<size_t>(channel)] =
+                            haveHorizontal ? horizontal : vertical;
+                    }
+                }
+                continue;
+            }
+
+            float sums[3] = {0.0f, 0.0f, 0.0f};
+            int count = 0;
+            const size_t neighbors[4] = {
+                haveLeft ? idx - 1 : idx,
+                haveRight ? idx + 1 : idx,
+                haveUp ? idx - static_cast<size_t>(rectWidth) : idx,
+                haveDown ? idx + static_cast<size_t>(rectWidth) : idx
+            };
+            const bool present[4] = {haveLeft, haveRight, haveUp, haveDown};
+            for (int neighbor = 0; neighbor < 4; ++neighbor) {
+                if (!present[neighbor]) {
+                    continue;
+                }
+                for (int channel = 0; channel < 3; ++channel) {
+                    sums[channel] += rectifiedRgb[neighbors[neighbor] * 3 + static_cast<size_t>(channel)];
+                }
+                ++count;
+            }
+            if (count > 0) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    rectifiedRgb[idx * 3 + static_cast<size_t>(channel)] =
+                        sums[channel] / static_cast<float>(count);
+                }
+            }
+        }
+    });
+
+    green.clear();
+    green.shrink_to_fit();
+    suppressPreviewFalseColor(rectifiedRgb, rectWidth, rectHeight);
+
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    for (size_t idx = 0; idx < rectPixelCount; ++idx) {
+        const double r = rectifiedRgb[idx * 3 + 0];
+        const double g = rectifiedRgb[idx * 3 + 1];
+        const double b = rectifiedRgb[idx * 3 + 2];
+        sumR += r;
+        sumG += g;
+        sumB += b;
+    }
+
+    const double pixelCount = static_cast<double>(rectPixelCount);
+    const double avgR = sumR / pixelCount;
+    const double avgG = sumG / pixelCount;
+    const double avgB = sumB / pixelCount;
+    const superccd::PreviewChannelGains gains =
+        superccd::derivePreviewChannelGains(avgR,
+                                            avgG,
+                                            avgB,
+                                            metadata.hasAsShotNeutral,
+                                            metadata.asShotNeutral,
+                                            metadata.asShotTint);
+    if (metadata.hasAsShotNeutral &&
+        metadata.asShotNeutral[0] > 0.0 &&
+        metadata.asShotNeutral[1] > 0.0 &&
+        metadata.asShotNeutral[2] > 0.0) {
+        logProcessing("WB from AsShotNeutral: R=%.4f G=%.4f B=%.4f tint=%.2f",
+                      gains.red, gains.green, gains.blue, metadata.asShotTint);
+    } else {
+        logProcessing("WB from average ratios: R=%.4f G=%.4f B=%.4f (no AsShotNeutral)",
+                      gains.red, gains.green, gains.blue);
+    }
+
+    QImage filled(rectWidth, rectHeight, QImage::Format_RGBX64);
+    if (filled.isNull()) {
+        error = QStringLiteral("Failed to allocate preview image.");
+        return false;
+    }
+    constexpr double kPreviewHighlightPercentile = 0.9995;
+    const double balancedSensorWhite = std::max(
+        {1.0,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - redBlack) * gains.red,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - greenBlack) * gains.green,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - blueBlack) * gains.blue});
+    std::vector<std::uint32_t> balancedHistogram(65536, 0);
+    std::uint64_t balancedSampleCount = 0;
+    for (size_t idx = 0; idx < rectPixelCount; ++idx) {
+        const double balancedLevel = std::max(
+            {0.0,
+             rectifiedRgb[idx * 3 + 0] * gains.red,
+             rectifiedRgb[idx * 3 + 1] * gains.green,
+             rectifiedRgb[idx * 3 + 2] * gains.blue});
+        const std::size_t bucket = static_cast<std::size_t>(std::clamp(
+            static_cast<int>(std::lround(balancedLevel)),
+            0,
+            65535));
+        balancedHistogram[bucket]++;
+        balancedSampleCount++;
+    }
+    const double highlightReference =
+        superccd::previewReferenceLevelFromHistogram(
+            balancedHistogram,
+            balancedSampleCount,
+            kPreviewHighlightPercentile);
+    // Use the sensor's white level as the reference so that different
+    // exposures produce visibly different previews.  The old behaviour
+    // normalised to the 99.95th-percentile highlight, which made every
+    // photo look equally bright regardless of the actual exposure.
+    // However, we must also consider the actual highlight content to
+    // preserve highlight recovery information from the R plane that
+    // may exceed the sensor's white level.
+    const double previewReference = std::max(balancedSensorWhite, highlightReference);
+    const double previewScale =
+        superccd::previewScaleToFit16Bit(previewReference);
+    logProcessing(
+        "Preview normalization: sensorWhite=%.2f highlightRef=%.2f reference=%.2f scale=%.6f",
+        balancedSensorWhite,
+        highlightReference,
+        previewReference,
+        previewScale);
+    const double contrastFactor = std::pow(2.0, toneContrast);
+    uchar *filledBits = filled.bits();
+    const qsizetype filledBytesPerLine = filled.bytesPerLine();
+    superccd::parallel::forRows(rectHeight, 8, [&](int y, unsigned) {
+        QRgba64 *scanLine = reinterpret_cast<QRgba64 *>(
+            filledBits + static_cast<qsizetype>(y) * filledBytesPerLine);
+        for (int x = 0; x < rectWidth; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(rectWidth) + static_cast<size_t>(x);
+            double linearR =
+                (rectifiedRgb[idx * 3 + 0] * gains.red * previewScale) / 65535.0;
+            double linearG =
+                (rectifiedRgb[idx * 3 + 1] * gains.green * previewScale) / 65535.0;
+            double linearB =
+                (rectifiedRgb[idx * 3 + 2] * gains.blue * previewScale) / 65535.0;
+
+            linearR = std::clamp(0.5 + (linearR - 0.5) * contrastFactor, 0.0, 1.0);
+            linearG = std::clamp(0.5 + (linearG - 0.5) * contrastFactor, 0.0, 1.0);
+            linearB = std::clamp(0.5 + (linearB - 0.5) * contrastFactor, 0.0, 1.0);
+
+            // Store the preview in linear light. The display pipeline applies
+            // the user-selected gamma curve, so the Gamma slider now behaves
+            // as a true display gamma (1.0 = linear, 2.2 = standard sRGB).
+            scanLine[x] = QRgba64::fromRgba64(
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearR * 65535.0)), 0, 65535)),
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearG * 65535.0)), 0, 65535)),
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearB * 65535.0)), 0, 65535)),
+                65535);
+        }
+    });
+
+    return applyPreviewRotationAndScale(
+        filled,
+        previewRotation,
+        maxSize,
+        preview,
+        error);
+}
+
+bool buildLinearRgbFromCfa(const std::vector<uint16_t> &cfa,
+                           int width,
+                           int height,
+                           std::vector<uint16_t> &rgb,
+                           int &rgbWidth,
+                           int &rgbHeight,
+                           QString &error)
+{
+    if (width < 2 || height < 2 || cfa.empty()) {
+        error = QStringLiteral("Invalid CFA data for linear RGB conversion.");
+        return false;
+    }
+
+    rgbWidth = width / 2;
+    rgbHeight = height / 2;
+    rgb.assign(static_cast<size_t>(rgbWidth) * static_cast<size_t>(rgbHeight) * 3, 0);
+
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    uint32_t maxR = 1;
+    uint32_t maxG = 1;
+    uint32_t maxB = 1;
+
+    for (int y = 0; y < rgbHeight; ++y) {
+        const int srcY = y * 2;
+        const size_t row0 = static_cast<size_t>(srcY) * static_cast<size_t>(width);
+        const size_t row1 = static_cast<size_t>(srcY + 1) * static_cast<size_t>(width);
+        for (int x = 0; x < rgbWidth; ++x) {
+            const int srcX = x * 2;
+            const uint16_t g1 = cfa[row0 + static_cast<size_t>(srcX)];
+            const uint16_t b = cfa[row0 + static_cast<size_t>(srcX + 1)];
+            const uint16_t r = cfa[row1 + static_cast<size_t>(srcX)];
+            const uint16_t g2 = cfa[row1 + static_cast<size_t>(srcX + 1)];
+            const uint32_t g = (static_cast<uint32_t>(g1) + static_cast<uint32_t>(g2)) / 2u;
+
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            maxR = std::max(maxR, static_cast<uint32_t>(r));
+            maxG = std::max(maxG, g);
+            maxB = std::max(maxB, static_cast<uint32_t>(b));
+        }
+    }
+
+    const double pixelCount = static_cast<double>(rgbWidth) * static_cast<double>(rgbHeight);
+    const double avgR = sumR / pixelCount;
+    const double avgG = sumG / pixelCount;
+    const double avgB = sumB / pixelCount;
+    const double gainR = avgR > 0.0 ? avgG / avgR : 1.0;
+    const double gainB = avgB > 0.0 ? avgG / avgB : 1.0;
+
+    for (int y = 0; y < rgbHeight; ++y) {
+        const int srcY = y * 2;
+        const size_t row0 = static_cast<size_t>(srcY) * static_cast<size_t>(width);
+        const size_t row1 = static_cast<size_t>(srcY + 1) * static_cast<size_t>(width);
+        for (int x = 0; x < rgbWidth; ++x) {
+            const int srcX = x * 2;
+            const uint16_t g1 = cfa[row0 + static_cast<size_t>(srcX)];
+            const uint16_t b = cfa[row0 + static_cast<size_t>(srcX + 1)];
+            const uint16_t r = cfa[row1 + static_cast<size_t>(srcX)];
+            const uint16_t g2 = cfa[row1 + static_cast<size_t>(srcX + 1)];
+            const double g = (static_cast<double>(g1) + static_cast<double>(g2)) * 0.5;
+
+            const size_t dstIdx = (static_cast<size_t>(y) * static_cast<size_t>(rgbWidth) + static_cast<size_t>(x)) * 3;
+            rgb[dstIdx + 0] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(r * gainR + 0.5), 0, 65535));
+            rgb[dstIdx + 1] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(g + 0.5), 0, 65535));
+            rgb[dstIdx + 2] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(b * gainB + 0.5), 0, 65535));
+        }
+    }
+
+    return true;
+}
+
+double bilinearSamplePlane(const std::vector<uint16_t> &plane,
+                           int width,
+                           int height,
+                           double x,
+                           double y)
+{
+    if (plane.empty() || width <= 0 || height <= 0) {
+        return 0.0;
+    }
+
+    x = std::clamp(x, 0.0, static_cast<double>(width - 1));
+    y = std::clamp(y, 0.0, static_cast<double>(height - 1));
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, width - 1);
+    const int y1 = std::min(y0 + 1, height - 1);
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+
+    const double v00 = plane[static_cast<size_t>(y0) * static_cast<size_t>(width) + static_cast<size_t>(x0)];
+    const double v10 = plane[static_cast<size_t>(y0) * static_cast<size_t>(width) + static_cast<size_t>(x1)];
+    const double v01 = plane[static_cast<size_t>(y1) * static_cast<size_t>(width) + static_cast<size_t>(x0)];
+    const double v11 = plane[static_cast<size_t>(y1) * static_cast<size_t>(width) + static_cast<size_t>(x1)];
+
+    const double top = (1.0 - fx) * v00 + fx * v10;
+    const double bottom = (1.0 - fx) * v01 + fx * v11;
+    return (1.0 - fy) * top + fy * bottom;
+}
+
+double bilinearSamplePlaneD(const std::vector<double> &plane,
+                            int width,
+                            int height,
+                            double x,
+                            double y)
+{
+    if (plane.empty() || width <= 0 || height <= 0) {
+        return 0.0;
+    }
+
+    x = std::clamp(x, 0.0, static_cast<double>(width - 1));
+    y = std::clamp(y, 0.0, static_cast<double>(height - 1));
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, width - 1);
+    const int y1 = std::min(y0 + 1, height - 1);
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+
+    const double v00 = plane[static_cast<size_t>(y0) * static_cast<size_t>(width) + static_cast<size_t>(x0)];
+    const double v10 = plane[static_cast<size_t>(y0) * static_cast<size_t>(width) + static_cast<size_t>(x1)];
+    const double v01 = plane[static_cast<size_t>(y1) * static_cast<size_t>(width) + static_cast<size_t>(x0)];
+    const double v11 = plane[static_cast<size_t>(y1) * static_cast<size_t>(width) + static_cast<size_t>(x1)];
+
+    const double top = (1.0 - fx) * v00 + fx * v10;
+    const double bottom = (1.0 - fx) * v01 + fx * v11;
+    return (1.0 - fy) * top + fy * bottom;
+}
+
+bool buildPreviewImageFromRgb(const std::vector<uint16_t> &rgb,
+                              int width,
+                              int height,
+                              const SuperCCDMetadata &metadata,
+                              int maxSize,
+                              QImage &preview,
+                              QString &error)
+{
+    if (width <= 0 || height <= 0 || rgb.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 3) {
+        error = QStringLiteral("Invalid RGB data for preview.");
+        return false;
+    }
+
+    QImage image(width, height, QImage::Format_RGBX64);
+    if (image.isNull()) {
+        error = QStringLiteral("Failed to allocate preview image.");
+        return false;
+    }
+
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    const double greenBlack = metadata.hasBlackLevels
+        ? (metadata.blackLevels[0] + metadata.blackLevels[3]) * 0.5
+        : 0.0;
+    const double blueBlack = metadata.hasBlackLevels ? metadata.blackLevels[1] : 0.0;
+    const double redBlack = metadata.hasBlackLevels ? metadata.blackLevels[2] : 0.0;
+    const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const double r = std::max(
+            0.0,
+            static_cast<double>(rgb[i * 3 + 0]) - redBlack);
+        const double g = std::max(
+            0.0,
+            static_cast<double>(rgb[i * 3 + 1]) - greenBlack);
+        const double b = std::max(
+            0.0,
+            static_cast<double>(rgb[i * 3 + 2]) - blueBlack);
+        sumR += r;
+        sumG += g;
+        sumB += b;
+    }
+
+    const double avgR = sumR / static_cast<double>(pixelCount);
+    const double avgG = sumG / static_cast<double>(pixelCount);
+    const double avgB = sumB / static_cast<double>(pixelCount);
+    const superccd::PreviewChannelGains gains =
+        superccd::derivePreviewChannelGains(avgR,
+                                            avgG,
+                                            avgB,
+                                            metadata.hasAsShotNeutral,
+                                            metadata.asShotNeutral,
+                                            metadata.asShotTint);
+    if (metadata.hasAsShotNeutral &&
+        metadata.asShotNeutral[0] > 0.0 &&
+        metadata.asShotNeutral[1] > 0.0 &&
+        metadata.asShotNeutral[2] > 0.0) {
+    }
+    const double balancedSensorWhite = std::max(
+        {1.0,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - redBlack) * gains.red,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - greenBlack) * gains.green,
+         std::max(1.0, static_cast<double>(metadata.whiteLevel) - blueBlack) * gains.blue});
+    
+    // Compute the actual highlight level from the image content to preserve
+    // highlight recovery information from the R plane that may exceed the
+    // sensor's white level.
+    std::vector<std::uint32_t> balancedHistogram(65536, 0);
+    std::uint64_t balancedSampleCount = 0;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const double balancedLevel = std::max(
+            {0.0,
+             std::max(0.0, static_cast<double>(rgb[i * 3 + 0]) - redBlack) * gains.red,
+             std::max(0.0, static_cast<double>(rgb[i * 3 + 1]) - greenBlack) * gains.green,
+             std::max(0.0, static_cast<double>(rgb[i * 3 + 2]) - blueBlack) * gains.blue});
+        const std::size_t bucket = static_cast<std::size_t>(std::clamp(
+            static_cast<int>(std::lround(balancedLevel)),
+            0,
+            65535));
+        balancedHistogram[bucket]++;
+        balancedSampleCount++;
+    }
+    constexpr double kPreviewHighlightPercentile = 0.9995;
+    const double highlightReference =
+        superccd::previewReferenceLevelFromHistogram(
+            balancedHistogram,
+            balancedSampleCount,
+            kPreviewHighlightPercentile);
+    
+    // Preserve original exposure: use the sensor white level as reference
+    // instead of stretching to the image's actual highlight content.
+    // However, we must also consider the actual highlight content to
+    // preserve highlight recovery information from the R plane that
+    // may exceed the sensor's white level.
+    const double previewReference = std::max(balancedSensorWhite, highlightReference);
+    const double previewScale =
+        superccd::previewScaleToFit16Bit(previewReference);
+
+    for (int y = 0; y < height; ++y) {
+        QRgba64 *scanLine = reinterpret_cast<QRgba64 *>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3;
+            const double linearR = std::clamp(
+                (std::max(0.0, static_cast<double>(rgb[idx + 0]) - redBlack)
+                 * gains.red * previewScale) / 65535.0,
+                0.0,
+                1.0);
+            const double linearG = std::clamp(
+                (std::max(0.0, static_cast<double>(rgb[idx + 1]) - greenBlack)
+                 * gains.green * previewScale) / 65535.0,
+                0.0,
+                1.0);
+            const double linearB = std::clamp(
+                (std::max(0.0, static_cast<double>(rgb[idx + 2]) - blueBlack)
+                 * gains.blue * previewScale) / 65535.0,
+                0.0,
+                1.0);
+            // Store the preview in linear light. The display pipeline applies
+            // the user-selected gamma curve, so the Gamma slider now behaves
+            // as a true display gamma (1.0 = linear, 2.2 = standard sRGB).
+            scanLine[x] = QRgba64::fromRgba64(
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearR * 65535.0)), 0, 65535)),
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearG * 65535.0)), 0, 65535)),
+                static_cast<quint16>(std::clamp(static_cast<int>(std::lround(linearB * 65535.0)), 0, 65535)),
+                65535);
+        }
+    }
+
+    if (maxSize > 0 && (image.width() > maxSize || image.height() > maxSize)) {
+        preview = image.scaled(maxSize, maxSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    } else {
+        preview = image;
+    }
+    return true;
+}
+
+bool applyPreviewRotationAndScale(const QImage &source,
+                                  int previewRotation,
+                                  int maxSize,
+                                  QImage &preview,
+                                  QString &error)
+{
+    if (source.isNull()) {
+        error = QStringLiteral("Invalid source image for preview.");
+        return false;
+    }
+
+    QTransform transform;
+    if (previewRotation == 90 || previewRotation == 180 || previewRotation == 270) {
+        transform.rotate(previewRotation);
+    }
+    QImage display = transform.isIdentity()
+        ? source
+        : source.transformed(transform, Qt::FastTransformation);
+
+    if (maxSize > 0 && (display.width() > maxSize || display.height() > maxSize)) {
+        preview = display.scaled(maxSize,
+                                 maxSize,
+                                 Qt::KeepAspectRatio,
+                                 Qt::SmoothTransformation);
+    } else {
+        preview = display;
+    }
+
+    return true;
+}
+
+bool buildPreviewImageFromSparseRgb(const std::vector<uint16_t> &rgb,
+                                    int width,
+                                    int height,
+                                    const SuperCCDMetadata &metadata,
+                                    int maxSize,
+                                    int previewRotation,
+                                    QImage &preview,
+                                    QString &error)
+{
+    if (width <= 0 || height <= 0 ||
+        rgb.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 3) {
+        error = QStringLiteral("Invalid sparse RGB data for preview.");
+        return false;
+    }
+
+    const int fujiWidth = metadata.fujiWidth > 0 ? metadata.fujiWidth : width / 2;
+    const int rectWidth = fujiWidth * 2 + 1;
+    const int rectHeight = (height - fujiWidth) * 2 + 1;
+    if (rectWidth <= 0 || rectHeight <= 0) {
+        error = QStringLiteral("Invalid native Fuji preview geometry.");
+        return false;
+    }
+
+    auto rowBounds = [&](int row) {
+        const int start = std::abs(fujiWidth - row);
+        const int end = std::min({width, rectHeight + fujiWidth - row, rectWidth - fujiWidth + row});
+        return std::pair<int, int>(start, end);
+    };
+
+    constexpr double kInvSqrt2 = 0.7071067811865476;
+    double minNativeX = std::numeric_limits<double>::max();
+    double minNativeY = std::numeric_limits<double>::max();
+    double maxNativeX = std::numeric_limits<double>::lowest();
+    double maxNativeY = std::numeric_limits<double>::lowest();
+
+    for (int row = 0; row < height; ++row) {
+        const auto [start, end] = rowBounds(row);
+        for (int col = start; col < end; ++col) {
+            const double nativeX =
+                static_cast<double>(fujiWidth - row + col) * kInvSqrt2;
+            const double nativeY =
+                static_cast<double>(row + col - fujiWidth) * kInvSqrt2;
+            minNativeX = std::min(minNativeX, nativeX);
+            minNativeY = std::min(minNativeY, nativeY);
+            maxNativeX = std::max(maxNativeX, nativeX);
+            maxNativeY = std::max(maxNativeY, nativeY);
+        }
+    }
+    if (!(minNativeX <= maxNativeX) || !(minNativeY <= maxNativeY)) {
+        error = QStringLiteral("Invalid native Fuji preview geometry.");
+        return false;
+    }
+
+    const int nativeWidth =
+        std::max(1, static_cast<int>(std::floor(maxNativeX - minNativeX + 1.5)));
+    const int nativeHeight =
+        std::max(1, static_cast<int>(std::floor(maxNativeY - minNativeY + 1.5)));
+    const size_t nativePixelCount =
+        static_cast<size_t>(nativeWidth) * static_cast<size_t>(nativeHeight);
+
+    auto sampleRgb = [&](double srcX, double srcY, uint16_t out[3]) {
+        if (srcX < 0.0 || srcX > static_cast<double>(width - 1) ||
+            srcY < 0.0 || srcY > static_cast<double>(height - 1)) {
+            out[0] = out[1] = out[2] = 0;
+            return;
+        }
+
+        const int x0 = static_cast<int>(std::floor(srcX));
+        const int y0 = static_cast<int>(std::floor(srcY));
+        const int x1 = std::min(x0 + 1, width - 1);
+        const int y1 = std::min(y0 + 1, height - 1);
+        const double fx = srcX - static_cast<double>(x0);
+        const double fy = srcY - static_cast<double>(y0);
+
+        auto isInsideDiamond = [&](int x, int y) {
+            if (y < 0 || y >= height || x < 0 || x >= width) {
+                return false;
+            }
+            const auto [start, end] = rowBounds(y);
+            return x >= start && x < end;
+        };
+        auto pixelAt = [&](int x, int y, int channel) -> double {
+            const size_t idx =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3
+                + static_cast<size_t>(channel);
+            return static_cast<double>(rgb[idx]);
+        };
+
+        for (int channel = 0; channel < 3; ++channel) {
+            double weightedSum = 0.0;
+            double weightSum = 0.0;
+            const struct {
+                int x;
+                int y;
+                double weight;
+            } taps[4] = {
+                {x0, y0, (1.0 - fx) * (1.0 - fy)},
+                {x1, y0, fx * (1.0 - fy)},
+                {x0, y1, (1.0 - fx) * fy},
+                {x1, y1, fx * fy}
+            };
+            for (const auto &tap : taps) {
+                if (tap.weight <= 0.0 || !isInsideDiamond(tap.x, tap.y)) {
+                    continue;
+                }
+                weightedSum += pixelAt(tap.x, tap.y, channel) * tap.weight;
+                weightSum += tap.weight;
+            }
+            out[channel] = weightSum > 0.0
+                ? static_cast<uint16_t>(std::clamp<int>(
+                    static_cast<int>(std::lround(weightedSum / weightSum)),
+                    0,
+                    65535))
+                : 0;
+        }
+    };
+
+    std::vector<uint16_t> nativeRgb(nativePixelCount * 3, 0);
+    constexpr double kSqrt2 = 1.4142135623730951;
+    for (int y = 0; y < nativeHeight; ++y) {
+        for (int x = 0; x < nativeWidth; ++x) {
+            const double diagX = (static_cast<double>(x) + minNativeX) * kSqrt2;
+            const double diagY = (static_cast<double>(y) + minNativeY) * kSqrt2;
+            const double srcCol = (diagX + diagY) * 0.5;
+            const double srcRow = fujiWidth + (diagY - diagX) * 0.5;
+
+            uint16_t sampled[3] = {0, 0, 0};
+            sampleRgb(srcCol, srcRow, sampled);
+
+            const size_t dstIdx =
+                (static_cast<size_t>(y) * static_cast<size_t>(nativeWidth) + static_cast<size_t>(x)) * 3;
+            nativeRgb[dstIdx + 0] = sampled[0];
+            nativeRgb[dstIdx + 1] = sampled[1];
+            nativeRgb[dstIdx + 2] = sampled[2];
+        }
+    }
+
+    SuperCCDMetadata previewMetadata = metadata;
+    if (previewMetadata.hasBlackLevels) {
+        const double meanBlack =
+            (previewMetadata.blackLevels[0] + previewMetadata.blackLevels[1] +
+             previewMetadata.blackLevels[2] + previewMetadata.blackLevels[3]) * 0.25;
+        previewMetadata.whiteLevel = static_cast<uint16_t>(std::max(
+            1,
+            static_cast<int>(previewMetadata.whiteLevel) -
+                static_cast<int>(std::lround(meanBlack))));
+        previewMetadata.blackLevels = {0.0, 0.0, 0.0, 0.0};
+        previewMetadata.hasBlackLevels = false;
+    }
+
+    QImage image;
+    if (!buildPreviewImageFromRgb(nativeRgb,
+                                  nativeWidth,
+                                  nativeHeight,
+                                  previewMetadata,
+                                  0,
+                                  image,
+                                  error)) {
+        return false;
+    }
+
+    return applyPreviewRotationAndScale(
+        image,
+        previewRotation,
+        maxSize,
+        preview,
+        error);
+}
+
+bool buildPreviewImageFromDngStyleCfa(const std::vector<uint16_t> &cfa,
+                                      int width,
+                                      int height,
+                                      const SuperCCDMetadata &metadata,
+                                      int maxSize,
+                                      int previewRotation,
+                                      QImage &preview,
+                                      QString &error)
+{
+    std::vector<uint16_t> sparseRgb;
+    int rgbWidth = 0;
+    int rgbHeight = 0;
+    if (!demosaicSparseBayerAmaze(cfa,
+                                  width,
+                                  height,
+                                  metadata,
+                                  sparseRgb,
+                                  rgbWidth,
+                                  rgbHeight,
+                                  error)) {
+        return false;
+    }
+
+    return buildPreviewImageFromSparseRgb(
+        sparseRgb,
+        rgbWidth,
+        rgbHeight,
+        metadata,
+        maxSize,
+        previewRotation,
+        preview,
+        error);
+}
+
+void rotateRgb90CW(std::vector<uint16_t> &rgb, int &width, int &height)
+{
+    if (width <= 0 || height <= 0 ||
+        rgb.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 3) {
+        return;
+    }
+
+    const int srcWidth = width;
+    const int srcHeight = height;
+    std::vector<uint16_t> rotated(static_cast<size_t>(srcWidth) * static_cast<size_t>(srcHeight) * 3, 0);
+
+    for (int y = 0; y < srcHeight; ++y) {
+        for (int x = 0; x < srcWidth; ++x) {
+            const int dstX = srcHeight - 1 - y;
+            const int dstY = x;
+            const size_t srcIdx = (static_cast<size_t>(y) * static_cast<size_t>(srcWidth) + static_cast<size_t>(x)) * 3;
+            const size_t dstIdx = (static_cast<size_t>(dstY) * static_cast<size_t>(srcHeight) + static_cast<size_t>(dstX)) * 3;
+            rotated[dstIdx + 0] = rgb[srcIdx + 0];
+            rotated[dstIdx + 1] = rgb[srcIdx + 1];
+            rotated[dstIdx + 2] = rgb[srcIdx + 2];
+        }
+    }
+
+    rgb.swap(rotated);
+    width = srcHeight;
+    height = srcWidth;
+}
+
+void mergeLinearPlane(const std::vector<uint16_t> &primary,
+                      const std::vector<uint16_t> &secondary,
+                      double rHeadroomScale,
+                      double blendStart,
+                      double blendEnd,
+                      std::vector<double> &desired,
+                      double &maxDesired,
+                      double &gainOut)
+{
+    desired.assign(primary.size(), 0.0);
+    maxDesired = 0.0;
+
+    uint16_t white = 0;
+    long double sumPrimary = 0.0;
+    long double sumSecondary = 0.0;
+    for (size_t i = 0; i < primary.size(); ++i) {
+        white = std::max(white, primary[i]);
+    }
+
+    const double whiteScale = white > 0 ? static_cast<double>(white) : 1.0;
+    for (size_t i = 0; i < primary.size(); ++i) {
+        const uint16_t s = primary[i];
+        const uint16_t r = secondary[i];
+        if (s == 0 || r == 0) {
+            continue;
+        }
+        const double normalized = static_cast<double>(s) / whiteScale;
+        if (normalized < 0.10 || normalized > 0.60) {
+            continue;
+        }
+        sumPrimary += s;
+        sumSecondary += r;
+    }
+
+    gainOut = sumSecondary > 0.0 ? static_cast<double>(sumPrimary / sumSecondary) : 1.0;
+    gainOut *= rHeadroomScale;
+
+    for (size_t i = 0; i < primary.size(); ++i) {
+        const double s = primary[i];
+        const double r = secondary[i];
+        if (s <= 0.0) {
+            continue;
+        }
+
+        if (r <= 0.0) {
+            desired[i] = s;
+            if (s > maxDesired) {
+                maxDesired = s;
+            }
+            continue;
+        }
+
+        const double normalized = s / whiteScale;
+        const double scaledR = r * gainOut;
+        double value = s;
+        if (normalized >= blendEnd) {
+            value = scaledR;
+        } else if (normalized > blendStart) {
+            const double t = (normalized - blendStart) / (blendEnd - blendStart);
+            value = (1.0 - t) * s + t * scaledR;
+        }
+        desired[i] = value;
+        if (value > maxDesired) {
+            maxDesired = value;
+        }
+    }
+}
+
+void composeLinearRgbFromPlanes(const LinearShotPlanes &planes,
+                                const std::vector<double> *mergedG1,
+                                const std::vector<double> *mergedR,
+                                const std::vector<double> *mergedB,
+                                const std::vector<double> *mergedG2,
+                                double outputScale,
+                                std::vector<uint16_t> &rgb,
+                                int &outWidth,
+                                int &outHeight)
+{
+    outWidth = planes.expandedWidth * 2;
+    outHeight = planes.height * 2;
+    rgb.assign(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 3, 0);
+
+    for (int y = 0; y < outHeight; ++y) {
+        const double sy = static_cast<double>(y) * 0.5;
+        for (int x = 0; x < outWidth; ++x) {
+            const double sx = static_cast<double>(x) * 0.5;
+            const double g1 = (mergedG1 ? sampleCompactPhasePlane(*mergedG1, planes.width, planes.height, 1, sx, sy)
+                                        : sampleCompactPhasePlane(planes.g1, planes.width, planes.height, 1, sx, sy)) * outputScale;
+            const double g2 = (mergedG2 ? sampleCompactPhasePlane(*mergedG2, planes.width, planes.height, 0, sx, sy)
+                                        : sampleCompactPhasePlane(planes.g2, planes.width, planes.height, 0, sx, sy)) * outputScale;
+
+            const double gLeft = ((mergedG1 ? sampleCompactPhasePlane(*mergedG1, planes.width, planes.height, 1, sx - 1.0, sy)
+                                            : sampleCompactPhasePlane(planes.g1, planes.width, planes.height, 1, sx - 1.0, sy)) +
+                                  (mergedG2 ? sampleCompactPhasePlane(*mergedG2, planes.width, planes.height, 0, sx - 1.0, sy)
+                                            : sampleCompactPhasePlane(planes.g2, planes.width, planes.height, 0, sx - 1.0, sy))) * 0.5;
+            const double gRight = ((mergedG1 ? sampleCompactPhasePlane(*mergedG1, planes.width, planes.height, 1, sx + 1.0, sy)
+                                             : sampleCompactPhasePlane(planes.g1, planes.width, planes.height, 1, sx + 1.0, sy)) +
+                                   (mergedG2 ? sampleCompactPhasePlane(*mergedG2, planes.width, planes.height, 0, sx + 1.0, sy)
+                                             : sampleCompactPhasePlane(planes.g2, planes.width, planes.height, 0, sx + 1.0, sy))) * 0.5;
+            const double gUp = ((mergedG1 ? sampleCompactPhasePlane(*mergedG1, planes.width, planes.height, 1, sx, sy - 1.0)
+                                          : sampleCompactPhasePlane(planes.g1, planes.width, planes.height, 1, sx, sy - 1.0)) +
+                                (mergedG2 ? sampleCompactPhasePlane(*mergedG2, planes.width, planes.height, 0, sx, sy - 1.0)
+                                          : sampleCompactPhasePlane(planes.g2, planes.width, planes.height, 0, sx, sy - 1.0))) * 0.5;
+            const double gDown = ((mergedG1 ? sampleCompactPhasePlane(*mergedG1, planes.width, planes.height, 1, sx, sy + 1.0)
+                                            : sampleCompactPhasePlane(planes.g1, planes.width, planes.height, 1, sx, sy + 1.0)) +
+                                  (mergedG2 ? sampleCompactPhasePlane(*mergedG2, planes.width, planes.height, 0, sx, sy + 1.0)
+                                            : sampleCompactPhasePlane(planes.g2, planes.width, planes.height, 0, sx, sy + 1.0))) * 0.5;
+            const double gradH = std::abs(gRight - gLeft);
+            const double gradV = std::abs(gDown - gUp);
+            const bool preferHorizontal = gradV > gradH;
+
+            const double r = (mergedR ? sampleCompactPhasePlaneDirectional(*mergedR, planes.width, planes.height, 1, sx, sy, preferHorizontal)
+                                      : sampleCompactPhasePlaneDirectional(planes.r, planes.width, planes.height, 1, sx, sy, preferHorizontal)) * outputScale;
+            const double b = (mergedB ? sampleCompactPhasePlaneDirectional(*mergedB, planes.width, planes.height, 0, sx, sy, preferHorizontal)
+                                      : sampleCompactPhasePlaneDirectional(planes.b, planes.width, planes.height, 0, sx, sy, preferHorizontal)) * outputScale;
+
+            const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(outWidth) + static_cast<size_t>(x)) * 3;
+            rgb[idx + 0] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(r + 0.5), 0, 65535));
+            rgb[idx + 1] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(((g1 + g2) * 0.5) + 0.5), 0, 65535));
+            rgb[idx + 2] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(b + 0.5), 0, 65535));
+        }
+    }
+}
+
+void suppressLinearRgbColorFringing(std::vector<uint16_t> &rgb,
+                                    int width,
+                                    int height,
+                                    double strength)
+{
+    if (strength <= 0.0) {
+        return;
+    }
+    strength = std::clamp(strength, 0.0, 1.0);
+    if (width <= 2 || height <= 2 || rgb.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 3) {
+        return;
+    }
+
+    std::vector<uint16_t> source = rgb;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3;
+            const double centerG = static_cast<double>(source[idx + 1]);
+            const double centerDr = static_cast<double>(source[idx + 0]) - centerG;
+            const double centerDb = static_cast<double>(source[idx + 2]) - centerG;
+            const double edgeThreshold = std::max(512.0, centerG * 0.025);
+
+            double sumDr = 0.0;
+            double sumDb = 0.0;
+            double sumW = 0.0;
+
+            static const int horizontalWeights[5] = {1, 3, 6, 3, 1};
+            for (int kx = -2; kx <= 2; ++kx) {
+                const int nx = std::clamp(x + kx, 0, width - 1);
+                const size_t nidx = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(nx)) * 3;
+                const double neighborG = static_cast<double>(source[nidx + 1]);
+                if (std::abs(neighborG - centerG) > edgeThreshold) {
+                    continue;
+                }
+
+                const double weight = static_cast<double>(horizontalWeights[kx + 2]);
+                const double neighborDr = static_cast<double>(source[nidx + 0]) - neighborG;
+                const double neighborDb = static_cast<double>(source[nidx + 2]) - neighborG;
+                sumDr += neighborDr * weight;
+                sumDb += neighborDb * weight;
+                sumW += weight;
+            }
+
+            for (int ky = -1; ky <= 1; ++ky) {
+                if (ky == 0) {
+                    continue;
+                }
+                const int ny = std::clamp(y + ky, 0, height - 1);
+                const size_t nidx = (static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3;
+                const double neighborG = static_cast<double>(source[nidx + 1]);
+                if (std::abs(neighborG - centerG) > edgeThreshold) {
+                    continue;
+                }
+
+                const double weight = 1.0;
+                const double neighborDr = static_cast<double>(source[nidx + 0]) - neighborG;
+                const double neighborDb = static_cast<double>(source[nidx + 2]) - neighborG;
+                sumDr += neighborDr * weight;
+                sumDb += neighborDb * weight;
+                sumW += weight;
+            }
+
+            const double filteredDr = sumW > 0.0 ? (sumDr / sumW) : centerDr;
+            const double filteredDb = sumW > 0.0 ? (sumDb / sumW) : centerDb;
+            const double mixedDr = (1.0 - strength) * centerDr + strength * filteredDr;
+            const double mixedDb = (1.0 - strength) * centerDb + strength * filteredDb;
+            rgb[idx + 0] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(centerG + mixedDr + 0.5), 0, 65535));
+            rgb[idx + 2] = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(centerG + mixedDb + 0.5), 0, 65535));
+        }
+    }
+}
+
+bool readSelectedShotLinearPlanes12MP(const QString &inputPath,
+                                      int shotSelect,
+                                      LinearShotPlanes &planes,
+                                      SuperCCDMetadata &metadata,
+                                      QString &error)
+{
+    // LibRaw is large enough to overflow the default macOS worker-thread stack.
+    // Keep it off the stack because this function can run through std::async.
+    auto rawStorage = std::make_unique<LibRaw>();
+    LibRaw &raw = *rawStorage;
+    raw.imgdata.rawparams.shot_select = static_cast<unsigned>(shotSelect);
+
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    populateBasicMetadata(raw, metadata);
+
+    result = raw.raw2image();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.image == nullptr) {
+        error = QStringLiteral("Unable to access Fuji-rotated image buffer.");
+        return false;
+    }
+
+    const int activeW = raw.imgdata.sizes.width;
+    const int activeH = raw.imgdata.sizes.height;
+    const int analysisWidth = activeW - (activeW % 2);
+    const int analysisHeight = activeH - (activeH % 2);
+    const int fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+
+    int minDiagX = INT_MAX;
+    int minDiagY = INT_MAX;
+    int maxDiagX = -1;
+    int maxDiagY = -1;
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(activeW) + static_cast<size_t>(x);
+            for (int c = 0; c < 4; ++c) {
+                if (raw.imgdata.image[srcIdx][c] == 0) {
+                    continue;
+                }
+                const int diagX = (x + y) >> 1;
+                const int diagY = ((y - x) >> 1) + fujiWidth;
+                if (diagX < minDiagX) minDiagX = diagX;
+                if (diagY < minDiagY) minDiagY = diagY;
+                if (diagX > maxDiagX) maxDiagX = diagX;
+                if (diagY > maxDiagY) maxDiagY = diagY;
+            }
+        }
+    }
+
+    if (minDiagX > maxDiagX || minDiagY > maxDiagY) {
+        error = QStringLiteral("Unable to derive 12MP linear bounds.");
+        return false;
+    }
+
+    const int diagWidth = maxDiagX - minDiagX + 1;
+    const int diagHeight = maxDiagY - minDiagY + 1;
+    const int planeWidth = ((diagWidth + 1) / 2) * 2;
+    const int compactPlaneWidth = planeWidth / 2;
+
+    std::vector<uint16_t> compactG1(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactR(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactB(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactG2(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskG1(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskR(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskB(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskG2(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(activeW) + static_cast<size_t>(x);
+            const int diagX = ((x + y) >> 1) - minDiagX;
+            const int diagY = (((y - x) >> 1) + fujiWidth) - minDiagY;
+            if (diagX < 0 || diagX >= diagWidth || diagY < 0 || diagY >= diagHeight) {
+                continue;
+            }
+
+            for (int c = 0; c < 4; ++c) {
+                const uint16_t sample = raw.imgdata.image[srcIdx][c];
+                if (sample == 0) {
+                    continue;
+                }
+
+                std::vector<uint16_t> *plane = nullptr;
+                std::vector<uint8_t> *mask = nullptr;
+                int phaseBase = 0;
+                switch (c) {
+                case 3:
+                    plane = &compactG1;
+                    mask = &maskG1;
+                    phaseBase = 1;
+                    break;
+                case 2:
+                    plane = &compactB;
+                    mask = &maskB;
+                    phaseBase = 0;
+                    break;
+                case 0:
+                    plane = &compactR;
+                    mask = &maskR;
+                    phaseBase = 1;
+                    break;
+                case 1:
+                    plane = &compactG2;
+                    mask = &maskG2;
+                    phaseBase = 0;
+                    break;
+                default:
+                    continue;
+                }
+
+                const int rowParity = diagY & 1;
+                const int expectedParity = ((rowParity & 1) == 0) ? phaseBase : (1 - phaseBase);
+                if ((diagX & 1) != expectedParity) {
+                    continue;
+                }
+
+                const int compactX = (diagX - expectedParity) / 2;
+                if (compactX < 0 || compactX >= compactPlaneWidth) {
+                    continue;
+                }
+
+                const size_t dstIdx = static_cast<size_t>(diagY) * static_cast<size_t>(compactPlaneWidth) +
+                                      static_cast<size_t>(compactX);
+                (*plane)[dstIdx] = sample;
+                (*mask)[dstIdx] = 1;
+            }
+        }
+    }
+
+    fillSparsePlane(compactG1, maskG1, compactPlaneWidth, diagHeight);
+    fillSparsePlane(compactR, maskR, compactPlaneWidth, diagHeight);
+    fillSparsePlane(compactB, maskB, compactPlaneWidth, diagHeight);
+    fillSparsePlane(compactG2, maskG2, compactPlaneWidth, diagHeight);
+
+    planes.g1 = std::move(compactG1);
+    planes.r = std::move(compactR);
+    planes.b = std::move(compactB);
+    planes.g2 = std::move(compactG2);
+    planes.width = compactPlaneWidth;
+    planes.height = diagHeight;
+    planes.expandedWidth = planeWidth;
+
+    logProcessing("readSelectedShotLinearPlanes12MP completed: shot=%d planeWidth=%d planeHeight=%d outWidth=%d outHeight=%d",
+                  shotSelect,
+                  planeWidth,
+                  diagHeight,
+                  planeWidth * 2,
+                  diagHeight * 2);
+    return true;
+}
+
+void downsampleCfaAndChannels(const std::vector<uint16_t> &sourceCfa,
+                              const std::vector<uint8_t> &sourceChannels,
+                              int sourceWidth,
+                              int sourceHeight,
+                              int factor,
+                              std::vector<uint16_t> &downCfa,
+                              std::vector<uint8_t> &downChannels,
+                              int &downWidth,
+                              int &downHeight)
+{
+    if (factor < 2) {
+        downCfa = sourceCfa;
+        downChannels = sourceChannels;
+        downWidth = sourceWidth;
+        downHeight = sourceHeight;
+        return;
+    }
+
+    downWidth = sourceWidth / factor;
+    downHeight = sourceHeight / factor;
+    downCfa.assign(static_cast<size_t>(downWidth) * static_cast<size_t>(downHeight), 0);
+    downChannels.assign(static_cast<size_t>(downWidth) * static_cast<size_t>(downHeight), 0xFF);
+
+    for (int y = 0; y < downHeight; ++y) {
+        const int srcY = std::min(sourceHeight - 1, y * factor + (y & 1));
+        for (int x = 0; x < downWidth; ++x) {
+            const int srcX = std::min(sourceWidth - 1, x * factor + (x & 1));
+            const size_t srcIdx = static_cast<size_t>(srcY) * static_cast<size_t>(sourceWidth) + static_cast<size_t>(srcX);
+            const size_t dstIdx = static_cast<size_t>(y) * static_cast<size_t>(downWidth) + static_cast<size_t>(x);
+            downCfa[dstIdx] = sourceCfa[srcIdx];
+            downChannels[dstIdx] = sourceChannels[srcIdx];
+        }
+    }
+}
+
+PairStats computePairStats(const ushort *rawImage,
+                           int rawWidth,
+                           int leftMargin,
+                           int topMargin,
+                           int visibleWidth,
+                           int visibleHeight,
+                           int dx,
+                           int dy)
+{
+    long double sumA = 0.0;
+    long double sumB = 0.0;
+    long double sumAA = 0.0;
+    long double sumBB = 0.0;
+    long double sumAB = 0.0;
+    long double sumRatio = 0.0;
+    long double sumAbsDiff = 0.0;
+    uint64_t count = 0;
+
+    for (int y = 0; y < visibleHeight; ++y) {
+        const int ny = y + dy;
+        if (ny < 0 || ny >= visibleHeight) {
+            continue;
+        }
+        for (int x = 0; x < visibleWidth; ++x) {
+            const int nx = x + dx;
+            if (nx < 0 || nx >= visibleWidth) {
+                continue;
+            }
+
+            const int rawRowA = y + topMargin;
+            const int rawColA = x + leftMargin;
+            const int rawRowB = ny + topMargin;
+            const int rawColB = nx + leftMargin;
+            const uint16_t a = rawImage[static_cast<size_t>(rawRowA) * static_cast<size_t>(rawWidth) +
+                                        static_cast<size_t>(rawColA)];
+            const uint16_t b = rawImage[static_cast<size_t>(rawRowB) * static_cast<size_t>(rawWidth) +
+                                        static_cast<size_t>(rawColB)];
+            if (a == 0 || b == 0) {
+                continue;
+            }
+
+            count++;
+            sumA += a;
+            sumB += b;
+            sumAA += static_cast<long double>(a) * static_cast<long double>(a);
+            sumBB += static_cast<long double>(b) * static_cast<long double>(b);
+            sumAB += static_cast<long double>(a) * static_cast<long double>(b);
+            const uint16_t hi = a > b ? a : b;
+            const uint16_t lo = a > b ? b : a;
+            if (lo > 0) {
+                sumRatio += static_cast<long double>(hi) / static_cast<long double>(lo);
+            }
+            sumAbsDiff += std::abs(static_cast<int>(a) - static_cast<int>(b));
+        }
+    }
+
+    PairStats stats;
+    stats.count = count;
+    if (count == 0) {
+        return stats;
+    }
+
+    const long double countLd = static_cast<long double>(count);
+    stats.meanA = static_cast<double>(sumA / countLd);
+    stats.meanB = static_cast<double>(sumB / countLd);
+    stats.meanRatio = static_cast<double>(sumRatio / countLd);
+    stats.meanAbsDiff = static_cast<double>(sumAbsDiff / countLd);
+
+    const long double cov = (sumAB / countLd) - (sumA / countLd) * (sumB / countLd);
+    const long double varA = (sumAA / countLd) - (sumA / countLd) * (sumA / countLd);
+    const long double varB = (sumBB / countLd) - (sumB / countLd) * (sumB / countLd);
+    if (varA > 0.0 && varB > 0.0) {
+        stats.corr = static_cast<double>(cov / std::sqrt(varA * varB));
+    }
+    return stats;
+}
+
+PairStats computePairStatsSameColor(LibRaw &raw,
+                                    const ushort *rawImage,
+                                    int rawWidth,
+                                    int leftMargin,
+                                    int topMargin,
+                                    int visibleWidth,
+                                    int visibleHeight,
+                                    int dx,
+                                    int dy,
+                                    int colorFilter)
+{
+    long double sumA = 0.0;
+    long double sumB = 0.0;
+    long double sumAA = 0.0;
+    long double sumBB = 0.0;
+    long double sumAB = 0.0;
+    long double sumRatio = 0.0;
+    long double sumAbsDiff = 0.0;
+    uint64_t count = 0;
+
+    for (int y = 0; y < visibleHeight; ++y) {
+        const int ny = y + dy;
+        if (ny < 0 || ny >= visibleHeight) {
+            continue;
+        }
+        for (int x = 0; x < visibleWidth; ++x) {
+            const int nx = x + dx;
+            if (nx < 0 || nx >= visibleWidth) {
+                continue;
+            }
+
+            const int rawRowA = y + topMargin;
+            const int rawColA = x + leftMargin;
+            const int rawRowB = ny + topMargin;
+            const int rawColB = nx + leftMargin;
+            const int colorA = raw.COLOR(rawRowA, rawColA);
+            const int colorB = raw.COLOR(rawRowB, rawColB);
+            if (colorA != colorB) {
+                continue;
+            }
+            if (colorFilter >= 0 && colorA != colorFilter) {
+                continue;
+            }
+
+            const uint16_t a = rawImage[static_cast<size_t>(rawRowA) * static_cast<size_t>(rawWidth) +
+                                        static_cast<size_t>(rawColA)];
+            const uint16_t b = rawImage[static_cast<size_t>(rawRowB) * static_cast<size_t>(rawWidth) +
+                                        static_cast<size_t>(rawColB)];
+            if (a == 0 || b == 0) {
+                continue;
+            }
+
+            count++;
+            sumA += a;
+            sumB += b;
+            sumAA += static_cast<long double>(a) * static_cast<long double>(a);
+            sumBB += static_cast<long double>(b) * static_cast<long double>(b);
+            sumAB += static_cast<long double>(a) * static_cast<long double>(b);
+            const uint16_t hi = a > b ? a : b;
+            const uint16_t lo = a > b ? b : a;
+            if (lo > 0) {
+                sumRatio += static_cast<long double>(hi) / static_cast<long double>(lo);
+            }
+            sumAbsDiff += std::abs(static_cast<int>(a) - static_cast<int>(b));
+        }
+    }
+
+    PairStats stats;
+    stats.count = count;
+    if (count == 0) {
+        return stats;
+    }
+
+    const long double countLd = static_cast<long double>(count);
+    stats.meanA = static_cast<double>(sumA / countLd);
+    stats.meanB = static_cast<double>(sumB / countLd);
+    stats.meanRatio = static_cast<double>(sumRatio / countLd);
+    stats.meanAbsDiff = static_cast<double>(sumAbsDiff / countLd);
+
+    const long double cov = (sumAB / countLd) - (sumA / countLd) * (sumB / countLd);
+    const long double varA = (sumAA / countLd) - (sumA / countLd) * (sumA / countLd);
+    const long double varB = (sumBB / countLd) - (sumB / countLd) * (sumB / countLd);
+    if (varA > 0.0 && varB > 0.0) {
+        stats.corr = static_cast<double>(cov / std::sqrt(varA * varB));
+    }
+    return stats;
+}
+
+void logNativePairDirectionStats(const ushort *rawImage,
+                                 int rawWidth,
+                                 int leftMargin,
+                                 int topMargin,
+                                 int visibleWidth,
+                                 int visibleHeight)
+{
+    struct DirectionSpec {
+        const char *name;
+        int dx;
+        int dy;
+    };
+    const DirectionSpec directions[] = {
+        {"right", 1, 0},
+        {"down", 0, 1},
+        {"down_right", 1, 1},
+        {"down_left", -1, 1},
+        {"right2", 2, 0},
+        {"down2", 0, 2},
+        {"diag_far_right", 2, 1},
+        {"diag_far_left", -2, 1},
+    };
+
+    for (const DirectionSpec &direction : directions) {
+        const PairStats stats = computePairStats(rawImage,
+                                                 rawWidth,
+                                                 leftMargin,
+                                                 topMargin,
+                                                 visibleWidth,
+                                                 visibleHeight,
+                                                 direction.dx,
+                                                 direction.dy);
+        logProcessing("Native pair stats %s dx=%d dy=%d count=%llu meanA=%.2f meanB=%.2f meanRatio=%.4f meanAbsDiff=%.2f corr=%.6f",
+                      direction.name,
+                      direction.dx,
+                      direction.dy,
+                      static_cast<unsigned long long>(stats.count),
+                      stats.meanA,
+                      stats.meanB,
+                      stats.meanRatio,
+                      stats.meanAbsDiff,
+                      stats.corr);
+    }
+}
+
+void logNativeSameColorPairDirectionStats(LibRaw &raw,
+                                          const ushort *rawImage,
+                                          int rawWidth,
+                                          int leftMargin,
+                                          int topMargin,
+                                          int visibleWidth,
+                                          int visibleHeight)
+{
+    struct DirectionSpec {
+        const char *name;
+        int dx;
+        int dy;
+    };
+    const DirectionSpec directions[] = {
+        {"right", 1, 0},
+        {"down", 0, 1},
+        {"down_right", 1, 1},
+        {"down_left", -1, 1},
+        {"right2", 2, 0},
+        {"down2", 0, 2},
+        {"diag_far_right", 2, 1},
+        {"diag_far_left", -2, 1},
+    };
+    const char *colorNames[] = {"R", "G1", "B", "G2"};
+
+    for (const DirectionSpec &direction : directions) {
+        const PairStats allStats = computePairStatsSameColor(raw,
+                                                             rawImage,
+                                                             rawWidth,
+                                                             leftMargin,
+                                                             topMargin,
+                                                             visibleWidth,
+                                                             visibleHeight,
+                                                             direction.dx,
+                                                             direction.dy,
+                                                             -1);
+        logProcessing("Same-color pair stats all %s dx=%d dy=%d count=%llu meanRatio=%.4f meanAbsDiff=%.2f corr=%.6f",
+                      direction.name,
+                      direction.dx,
+                      direction.dy,
+                      static_cast<unsigned long long>(allStats.count),
+                      allStats.meanRatio,
+                      allStats.meanAbsDiff,
+                      allStats.corr);
+
+        for (int color = 0; color < 4; ++color) {
+            const PairStats colorStats = computePairStatsSameColor(raw,
+                                                                   rawImage,
+                                                                   rawWidth,
+                                                                   leftMargin,
+                                                                   topMargin,
+                                                                   visibleWidth,
+                                                                   visibleHeight,
+                                                                   direction.dx,
+                                                                   direction.dy,
+                                                                   color);
+            logProcessing("Same-color pair stats %s %s dx=%d dy=%d count=%llu meanRatio=%.4f meanAbsDiff=%.2f corr=%.6f",
+                          colorNames[color],
+                          direction.name,
+                          direction.dx,
+                          direction.dy,
+                          static_cast<unsigned long long>(colorStats.count),
+                          colorStats.meanRatio,
+                          colorStats.meanAbsDiff,
+                          colorStats.corr);
+        }
+    }
+}
+
+void fillSparsePlane(std::vector<uint16_t> &plane,
+                     const std::vector<uint8_t> &mask,
+                     int planeWidth,
+                     int planeHeight)
+{
+    const int diagonalOffsets[4][2] = {
+        {-1, -1}, {1, -1}, {-1, 1}, {1, 1}
+    };
+    const int horizontalOffsets[2][2] = {
+        {-1, 0}, {1, 0}
+    };
+    const int verticalOffsets[2][2] = {
+        {0, -1}, {0, 1}
+    };
+
+    for (int y = 0; y < planeHeight; ++y) {
+        for (int x = 0; x < planeWidth; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(planeWidth) +
+                               static_cast<size_t>(x);
+            if (mask[idx]) {
+                continue;
+            }
+
+            uint16_t value = averageSamples(plane, mask, planeWidth, planeHeight,
+                                            diagonalOffsets, 4, x, y);
+            if (value == 0) {
+                value = averageSamples(plane, mask, planeWidth, planeHeight,
+                                       horizontalOffsets, 2, x, y);
+            }
+            if (value == 0) {
+                value = averageSamples(plane, mask, planeWidth, planeHeight,
+                                       verticalOffsets, 2, x, y);
+            }
+            plane[idx] = value;
+        }
+    }
+}
+}
+
+bool SuperCCDProcessor::readMetadata(const QString &inputPath,
+                                     SuperCCDMetadata &metadata,
+                                     QString *error)
+{
+    metadata = SuperCCDMetadata{};
+
+    LibRaw raw;
+    const int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        if (error) {
+            *error = QString::fromUtf8(libraw_strerror(result));
+        }
+        return false;
+    }
+
+    const int unpackResult = raw.unpack();
+    if (unpackResult != LIBRAW_SUCCESS) {
+        if (error) {
+            *error = QString::fromUtf8(libraw_strerror(unpackResult));
+        }
+        raw.recycle();
+        return false;
+    }
+
+    populateBasicMetadata(raw, metadata);
+    raw.recycle();
+    return true;
+}
+
+bool SuperCCDProcessor::copyExifMetadata(const QString &inputPath,
+                                         const QString &outputPath,
+                                         QString *error)
+{
+#ifdef __APPLE__
+    const QString suffix = QFileInfo(outputPath).suffix().toLower();
+    if (suffix == QStringLiteral("jpg") || suffix == QStringLiteral("jpeg") ||
+        suffix == QStringLiteral("tif") || suffix == QStringLiteral("tiff")) {
+        SuperCCDMetadata metadata;
+        QString metadataError;
+        if (readMetadata(inputPath, metadata, &metadataError)) {
+            QString nativeError;
+            if (writeImageMetadataWithImageIO(outputPath, metadata, &nativeError)) {
+                return true;
+            }
+            logProcessing("copyExifMetadata: ImageIO metadata write failed for %s -> %s ('%s')",
+                          inputPath.toUtf8().constData(),
+                          outputPath.toUtf8().constData(),
+                          nativeError.left(200).toUtf8().constData());
+        } else {
+            logProcessing("copyExifMetadata: readMetadata failed before ImageIO metadata write for %s ('%s')",
+                          inputPath.toUtf8().constData(),
+                          metadataError.left(200).toUtf8().constData());
+        }
+    }
+#endif
+
+    const QString exifTool = findExifToolExecutable();
+    if (exifTool.isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("exiftool not found");
+        }
+        return false;
+    }
+
+    const QStringList copyArguments = {
+        QStringLiteral("-overwrite_original_in_place"),
+        QStringLiteral("-m"),
+        QStringLiteral("-tagsFromFile"),
+        inputPath,
+        QStringLiteral("-EXIF:Make"),
+        QStringLiteral("-EXIF:Model"),
+        QStringLiteral("-EXIF:LensModel"),
+        QStringLiteral("-EXIF:FocalLength"),
+        QStringLiteral("-EXIF:FNumber"),
+        QStringLiteral("-EXIF:ExposureTime"),
+        QStringLiteral("-EXIF:ISO"),
+        QStringLiteral("-EXIF:DateTimeOriginal"),
+        QStringLiteral("-EXIF:CreateDate"),
+        QStringLiteral("-EXIF:ModifyDate"),
+        outputPath
+    };
+
+    QProcess process;
+    process.start(exifTool, copyArguments);
+    if (!process.waitForFinished(15000) ||
+        process.exitStatus() != QProcess::NormalExit ||
+        process.exitCode() != 0) {
+        const QString firstStderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+        const QString firstStdoutText = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        logProcessing("copyExifMetadata: exiftool tag copy failed for %s -> %s (code=%d, stderr='%s', stdout='%s')",
+                      inputPath.toUtf8().constData(),
+                      outputPath.toUtf8().constData(),
+                      process.exitCode(),
+                      firstStderrText.left(200).toUtf8().constData(),
+                      firstStdoutText.left(200).toUtf8().constData());
+
+        SuperCCDMetadata metadata;
+        QString metadataError;
+        if (!readMetadata(inputPath, metadata, &metadataError)) {
+            if (error) {
+                *error = firstStderrText.isEmpty()
+                    ? QStringLiteral("exiftool failed with exit code %1").arg(process.exitCode())
+                    : firstStderrText;
+            }
+            return false;
+        }
+
+        QStringList fallbackArguments = {
+            QStringLiteral("-overwrite_original_in_place"),
+            QStringLiteral("-m")
+        };
+
+        auto appendStringTag = [&fallbackArguments](const QString &tag, const QString &value) {
+            const QString trimmed = value.trimmed();
+            if (!trimmed.isEmpty()) {
+                fallbackArguments.append(tag + QStringLiteral("=") + trimmed);
+            }
+        };
+        auto appendNumericTag = [&fallbackArguments](const QString &tag, double value) {
+            if (value > 0.0) {
+                fallbackArguments.append(tag + QStringLiteral("=") + QString::number(value, 'g', 12));
+            }
+        };
+
+        appendStringTag(QStringLiteral("-EXIF:Make"), metadata.make);
+        appendStringTag(QStringLiteral("-EXIF:Model"), metadata.model);
+        appendStringTag(QStringLiteral("-EXIF:LensModel"), metadata.lensModel);
+        appendNumericTag(QStringLiteral("-EXIF:FocalLength"), metadata.focalLength);
+        appendNumericTag(QStringLiteral("-EXIF:FNumber"), metadata.aperture);
+        appendNumericTag(QStringLiteral("-EXIF:ExposureTime"), metadata.shutter);
+        if (metadata.iso > 0) {
+            fallbackArguments.append(QStringLiteral("-EXIF:ISO=") + QString::number(metadata.iso));
+        }
+        appendStringTag(QStringLiteral("-EXIF:DateTimeOriginal"), metadata.dateTime);
+        appendStringTag(QStringLiteral("-EXIF:CreateDate"), metadata.dateTime);
+        appendStringTag(QStringLiteral("-EXIF:ModifyDate"), metadata.dateTime);
+        fallbackArguments.append(outputPath);
+
+        QProcess fallbackProcess;
+        fallbackProcess.start(exifTool, fallbackArguments);
+        if (!fallbackProcess.waitForFinished(15000) ||
+            fallbackProcess.exitStatus() != QProcess::NormalExit ||
+            fallbackProcess.exitCode() != 0) {
+            const QString fallbackStderrText = QString::fromUtf8(fallbackProcess.readAllStandardError()).trimmed();
+            const QString fallbackStdoutText = QString::fromUtf8(fallbackProcess.readAllStandardOutput()).trimmed();
+            logProcessing("copyExifMetadata: exiftool metadata fallback failed for %s -> %s (code=%d, stderr='%s', stdout='%s')",
+                          inputPath.toUtf8().constData(),
+                          outputPath.toUtf8().constData(),
+                          fallbackProcess.exitCode(),
+                          fallbackStderrText.left(200).toUtf8().constData(),
+                          fallbackStdoutText.left(200).toUtf8().constData());
+            if (error) {
+                *error = fallbackStderrText.isEmpty()
+                    ? (firstStderrText.isEmpty()
+                        ? QStringLiteral("exiftool failed with exit code %1").arg(fallbackProcess.exitCode())
+                        : firstStderrText)
+                    : fallbackStderrText;
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool SuperCCDProcessor::extractEmbeddedThumbnail(const QString &inputPath,
+                                                 QImage &thumbnail,
+                                                 QString *error)
+{
+    thumbnail = QImage();
+
+    LibRaw raw;
+    int ret = raw.open_file(inputPath.toUtf8().constData());
+    if (ret != LIBRAW_SUCCESS) {
+        if (error) {
+            *error = QStringLiteral("Unable to open RAF for thumbnail extraction: %1")
+                         .arg(QString::fromUtf8(libraw_strerror(ret)));
+        }
+        return false;
+    }
+
+    const int thumbCount = std::max(1, raw.imgdata.thumbs_list.thumbcount);
+    int bestArea = -1;
+    for (int i = 0; i < thumbCount; ++i) {
+        ret = (i == 0) ? raw.unpack_thumb() : raw.unpack_thumb_ex(i);
+        if (ret != LIBRAW_SUCCESS) {
+            continue;
+        }
+
+        int thumbErr = LIBRAW_SUCCESS;
+        libraw_processed_image_t *thumb = raw.dcraw_make_mem_thumb(&thumbErr);
+        if (!thumb || thumbErr != LIBRAW_SUCCESS) {
+            if (thumb) {
+                LibRaw::dcraw_clear_mem(thumb);
+            }
+            continue;
+        }
+
+        QImage candidate = qImageFromLibRawProcessedThumb(thumb);
+        LibRaw::dcraw_clear_mem(thumb);
+        if (!candidate.isNull()) {
+            const int area = candidate.width() * candidate.height();
+            if (area > bestArea) {
+                bestArea = area;
+                thumbnail = candidate;
+            }
+        }
+    }
+
+    raw.recycle();
+
+    if (thumbnail.isNull()) {
+        // Try direct JPEG extraction from RAF file first (doesn't require external tools)
+        QString directErr;
+        thumbnail = extractEmbeddedJpegFromRaf(inputPath, &directErr);
+        if (!thumbnail.isNull()) {
+            return true;
+        }
+        logProcessing("extractEmbeddedThumbnail: direct JPEG extraction failed ('%s') for %s, trying exiftool",
+                      directErr.toUtf8().constData(), inputPath.toUtf8().constData());
+        
+        // Fall back to exiftool if direct extraction failed
+        QString exifErr;
+        thumbnail = extractThumbnailWithExifTool(inputPath, &exifErr);
+        if (!thumbnail.isNull()) {
+            return true;
+        }
+        if (error) {
+            if (!directErr.isEmpty()) {
+                *error = QStringLiteral("RAF thumbnail extraction failed: direct=%1, exiftool=%2")
+                             .arg(directErr)
+                             .arg(exifErr);
+            } else if (!exifErr.isEmpty()) {
+                *error = QStringLiteral("RAF thumbnail extraction failed: %1").arg(exifErr);
+            } else {
+                *error = QStringLiteral("RAF thumbnail extraction failed.");
+            }
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool SuperCCDProcessor::process(const QString &inputPath,
+                                const QString &outputPath,
+                                const ConversionSettings &settings,
+                                QString &error)
+{
+    logProcessing("process start: %s -> %s", inputPath.toUtf8().constData(), outputPath.toUtf8().constData());
+    const char *modeLabel = "6MP CFA";
+    switch (settings.exportMode) {
+    case ExportMode::RawCfa6MP:
+        modeLabel = "6MP CFA";
+        break;
+    case ExportMode::Linear12MPExperimental:
+        modeLabel = "12MP linear experimental";
+        break;
+    }
+    logProcessing("Selected-shot export mode: %s", modeLabel);
+
+    if (settings.exportMode == ExportMode::Linear12MPExperimental) {
+        LinearShotPlanes sPlanes;
+        LinearShotPlanes rPlanes;
+        SuperCCDMetadata metadata;
+        SuperCCDMetadata rMetadata;
+        if (!readSelectedShotLinearPlanes12MP(inputPath, 0, sPlanes, metadata, error)) {
+            return false;
+        }
+        if (!readSelectedShotLinearPlanes12MP(inputPath, 1, rPlanes, rMetadata, error)) {
+            return false;
+        }
+        if (metadata.embeddedThumbnail.isNull()) {
+            extractEmbeddedThumbnail(inputPath, metadata.embeddedThumbnail, nullptr);
+        }
+        if (sPlanes.width != rPlanes.width || sPlanes.height != rPlanes.height) {
+            error = QStringLiteral("S and R linear plane dimensions do not match.");
+            return false;
+        }
+
+        std::vector<double> mergedG1;
+        std::vector<double> mergedR;
+        std::vector<double> mergedB;
+        std::vector<double> mergedG2;
+        double gainG1 = 1.0;
+        double gainR = 1.0;
+        double gainB = 1.0;
+        double gainG2 = 1.0;
+        double maxG1 = 0.0;
+        double maxR = 0.0;
+        double maxB = 0.0;
+        double maxG2 = 0.0;
+        mergeLinearPlane(sPlanes.g1, rPlanes.g1, settings.rHeadroomScale, 0.95, 0.995, mergedG1, maxG1, gainG1);
+        mergeLinearPlane(sPlanes.r, rPlanes.r, settings.rHeadroomScale, 0.95, 0.995, mergedR, maxR, gainR);
+        mergeLinearPlane(sPlanes.b, rPlanes.b, settings.rHeadroomScale, 0.95, 0.995, mergedB, maxB, gainB);
+        mergeLinearPlane(sPlanes.g2, rPlanes.g2, settings.rHeadroomScale, 0.95, 0.995, mergedG2, maxG2, gainG2);
+
+        double outputScale = 1.0;
+        const double maxDesired = std::max(std::max(maxG1, maxR), std::max(maxB, maxG2));
+        if (maxDesired > 65535.0) {
+            outputScale = 65535.0 / maxDesired;
+        }
+        logProcessing("12MP linear merge gains: g1=%0.5f r=%0.5f b=%0.5f g2=%0.5f maxDesired=%0.2f outputScale=%0.6f",
+                      gainG1, gainR, gainB, gainG2, maxDesired, outputScale);
+
+        std::vector<uint16_t> sRgb;
+        std::vector<uint16_t> rRgb;
+        std::vector<uint16_t> mergedRgb;
+        int sWidth = 0;
+        int sHeight = 0;
+        int rWidth = 0;
+        int rHeight = 0;
+        int mergedWidth = 0;
+        int mergedHeight = 0;
+        composeLinearRgbFromPlanes(sPlanes, nullptr, nullptr, nullptr, nullptr, 1.0, sRgb, sWidth, sHeight);
+        composeLinearRgbFromPlanes(rPlanes, nullptr, nullptr, nullptr, nullptr, 1.0, rRgb, rWidth, rHeight);
+        if (sWidth != rWidth || sHeight != rHeight) {
+            error = QStringLiteral("Linear RGB output dimensions do not match.");
+            return false;
+        }
+        composeLinearRgbFromPlanes(sPlanes, &mergedG1, &mergedR, &mergedB, &mergedG2, outputScale, mergedRgb, mergedWidth, mergedHeight);
+        if (sWidth != mergedWidth || sHeight != mergedHeight) {
+            error = QStringLiteral("Merged linear RGB output dimensions do not match.");
+            return false;
+        }
+        suppressLinearRgbColorFringing(sRgb, sWidth, sHeight, settings.linearChromaSuppression);
+        suppressLinearRgbColorFringing(rRgb, rWidth, rHeight, settings.linearChromaSuppression);
+        suppressLinearRgbColorFringing(mergedRgb, mergedWidth, mergedHeight, settings.linearChromaSuppression);
+        rotateRgb90CW(sRgb, sWidth, sHeight);
+        rotateRgb90CW(rRgb, rWidth, rHeight);
+        rotateRgb90CW(mergedRgb, mergedWidth, mergedHeight);
+        if (sWidth != rWidth || sHeight != rHeight || sWidth != mergedWidth || sHeight != mergedHeight) {
+            error = QStringLiteral("Rotated linear RGB output dimensions do not match.");
+            return false;
+        }
+
+        struct OutputSpec {
+            const char *suffix;
+            const std::vector<uint16_t> *buffer;
+        };
+        const OutputSpec outputs[] = {
+            {"_s_pixels.dng", &sRgb},
+            {"_r_pixels.dng", &rRgb},
+            {"_sr_merged.dng", &mergedRgb},
+        };
+
+        if (!settings.exportPlaneImages) {
+            // Only export merged DNG with original filename
+            if (!DngWriter::writeLinearDng(outputPath, mergedRgb, sWidth, sHeight, 16, metadata, error)) {
+                return false;
+            }
+        } else {
+            // Export all plane images
+            for (const OutputSpec &outputSpec : outputs) {
+                QString planeOutputPath = outputPath;
+                if (planeOutputPath.endsWith(QLatin1String(".dng"), Qt::CaseInsensitive)) {
+                    planeOutputPath.chop(4);
+                    planeOutputPath += QString::fromLatin1(outputSpec.suffix);
+                } else {
+                    planeOutputPath += QString::fromLatin1(outputSpec.suffix);
+                }
+                if (!DngWriter::writeLinearDng(planeOutputPath, *outputSpec.buffer, sWidth, sHeight, 16, metadata, error)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    if (!ensure6MPCache(inputPath, m_cfaPreviewCache, error)) {
+        return false;
+    }
+
+    std::vector<uint16_t> mergedSr;
+    QString mergeSummary;
+    double appliedOutputScale = 1.0;
+    mergePrimaryAndProjectedSecondary(m_cfaPreviewCache.sUpsampled,
+                                     m_cfaPreviewCache.sChannels,
+                                     m_cfaPreviewCache.rUpsampled,
+                                     m_cfaPreviewCache.width,
+                                     m_cfaPreviewCache.height,
+                                     settings.rHeadroomScale,
+                                     settings.rTransitionStart,
+                                     settings.rTransitionDelay,
+                                     settings.rTransitionSmoothness,
+                                     settings.rLumaNoiseReduction,
+                                     false,
+                                     mergedSr,
+                                     mergeSummary,
+                                     &appliedOutputScale);
+    logProcessing("S+R merge summary: %s", mergeSummary.toUtf8().constData());
+
+    QString firstError;
+    bool wroteAny = false;
+
+    struct OutputSpec {
+        const char *label;
+        const char *suffix;
+        const std::vector<uint16_t> *buffer;
+    };
+
+    const OutputSpec outputs[] = {
+        {"S", "_s_pixels.dng", &m_cfaPreviewCache.sCfa},
+        {"R", "_r_pixels.dng", &m_cfaPreviewCache.rCfa},
+        {"SR", "_sr_merged.dng", &mergedSr},
+    };
+
+    // If not exporting plane images, only export merged DNG with original filename
+    if (!settings.exportPlaneImages) {
+        const OutputSpec &outputSpec = outputs[2]; // SR merged
+        SuperCCDMetadata outputMetadata = m_cfaPreviewCache.metadata;
+        uint16_t outputWhiteLevel = 0;
+        for (uint16_t sample : *outputSpec.buffer) {
+            if (sample > outputWhiteLevel) {
+                outputWhiteLevel = sample;
+            }
+        }
+        // Use actual maximum from buffer - don't scale white level by appliedOutputScale
+        // as that would incorrectly lower it when merge scales down values
+        outputMetadata.whiteLevel = std::max<uint16_t>(outputWhiteLevel, 1);
+        outputMetadata.baselineExposure = 0.0;
+        outputMetadata.hasBaselineExposure = false;
+
+        logProcessing("starting DngWriter::writeDng (merged only): %s (%dx%d)",
+                      outputPath.toUtf8().constData(),
+                      m_cfaPreviewCache.width,
+                      m_cfaPreviewCache.height);
+        if (!DngWriter::writeDng(outputPath,
+                                 *outputSpec.buffer,
+                                 m_cfaPreviewCache.width,
+                                 m_cfaPreviewCache.height,
+                                 m_cfaPreviewCache.bitDepth,
+                                 outputMetadata,
+                                 error)) {
+            logProcessing("writeDng failed for merged output: %s", error.toUtf8().constData());
+            return false;
+        }
+        wroteAny = true;
+        logProcessing("DngWriter::writeDng returned successfully for merged output");
+    } else {
+        for (const OutputSpec &outputSpec : outputs) {
+            QString planeOutputPath = outputPath;
+            if (planeOutputPath.endsWith(QLatin1String(".dng"), Qt::CaseInsensitive)) {
+                planeOutputPath.chop(4);
+                planeOutputPath += QString::fromLatin1(outputSpec.suffix);
+            } else {
+                planeOutputPath += QString::fromLatin1(outputSpec.suffix);
+            }
+
+            SuperCCDMetadata outputMetadata = m_cfaPreviewCache.metadata;
+            uint16_t outputWhiteLevel = 0;
+            for (uint16_t sample : *outputSpec.buffer) {
+                if (sample > outputWhiteLevel) {
+                    outputWhiteLevel = sample;
+                }
+            }
+            // Use actual maximum from buffer - don't scale white level by appliedOutputScale
+            // as that would incorrectly lower it when merge scales down values
+            outputMetadata.whiteLevel = std::max<uint16_t>(outputWhiteLevel, 1);
+            if (std::strcmp(outputSpec.label, "SR") == 0) {
+                outputMetadata.baselineExposure = 0.0;
+                outputMetadata.hasBaselineExposure = false;
+                logProcessing("merged CFA metadata before write: outputWhite=%u baselineExposure=%.6f hasBaselineExposure=%d",
+                              outputMetadata.whiteLevel,
+                              outputMetadata.baselineExposure,
+                              outputMetadata.hasBaselineExposure ? 1 : 0);
+            }
+
+            logProcessing("starting DngWriter::writeDng: %s (%dx%d)",
+                          planeOutputPath.toUtf8().constData(),
+                          m_cfaPreviewCache.width,
+                          m_cfaPreviewCache.height);
+            if (!DngWriter::writeDng(planeOutputPath,
+                                     *outputSpec.buffer,
+                                     m_cfaPreviewCache.width,
+                                     m_cfaPreviewCache.height,
+                                     m_cfaPreviewCache.bitDepth,
+                                     outputMetadata,
+                                     error)) {
+                logProcessing("writeDng failed for %s: %s",
+                              outputSpec.label,
+                              error.toUtf8().constData());
+                if (firstError.isEmpty()) {
+                    firstError = error;
+                }
+                continue;
+            }
+
+            wroteAny = true;
+            logProcessing("DngWriter::writeDng returned successfully for %s", planeOutputPath.toUtf8().constData());
+        }
+    }
+
+    if (!wroteAny) {
+        error = firstError.isEmpty() ? QStringLiteral("No plane exports succeeded.") : firstError;
+        return false;
+    }
+
+    return true;
+}
+
+bool SuperCCDProcessor::renderPreview(const QString &inputPath,
+                                      const ConversionSettings &settings,
+                                      QImage &preview,
+                                      QString &error)
+{
+    logProcessing("renderPreview: cfa=%dx%d fujiWidth=%d", m_cfaPreviewCache.width, m_cfaPreviewCache.height, m_cfaPreviewCache.metadata.fujiWidth);
+    if (!ensure6MPCache(inputPath, m_cfaPreviewCache, error)) {
+        return false;
+    }
+
+    std::vector<uint16_t> mergedSr;
+    QString mergeSummary;
+    mergePrimaryAndProjectedSecondary(m_cfaPreviewCache.sUpsampled,
+                                      m_cfaPreviewCache.sChannels,
+                                      m_cfaPreviewCache.rUpsampled,
+                                      m_cfaPreviewCache.width,
+                                      m_cfaPreviewCache.height,
+                                      settings.rHeadroomScale,
+                                      settings.rTransitionStart,
+                                      settings.rTransitionDelay,
+                                      settings.rTransitionSmoothness,
+                                      settings.rLumaNoiseReduction,
+                                      false,
+                                      mergedSr,
+                                      mergeSummary);
+
+    if (settings.previewMethod == PreviewMethod::Reconstruction) {
+        logProcessing("renderPreview: before Reconstruct buildPreviewImageFromCfa: preview=%dx%d", preview.width(), preview.height());
+        return buildPreviewImageFromCfa(
+            mergedSr,
+            m_cfaPreviewCache.width,
+            m_cfaPreviewCache.height,
+            m_cfaPreviewCache.metadata,
+            settings.previewMaxSize,
+            settings.previewRotation,
+            settings.toneContrast,
+            preview,
+            error);
+    }
+
+    logProcessing("renderPreview: before Amaze buildPreviewImageFromDngStyleCfa: preview=%dx%d", preview.width(), preview.height());
+    return buildPreviewImageFromDngStyleCfa(mergedSr,
+                                            m_cfaPreviewCache.width,
+                                            m_cfaPreviewCache.height,
+                                            m_cfaPreviewCache.metadata,
+                                            settings.previewMaxSize,
+                                            settings.previewRotation,
+                                            preview,
+                                            error);
+}
+
+bool SuperCCDProcessor::ensure6MPCache(const QString &inputPath,
+                                       CfaPreviewCache &cache,
+                                       QString &error)
+{
+    const QFileInfo fileInfo(inputPath);
+    if (!fileInfo.exists()) {
+        error = QStringLiteral("Input file does not exist.");
+        return false;
+    }
+
+    const QDateTime lastModifiedUtc = fileInfo.lastModified().toUTC();
+    const qint64 fileSize = fileInfo.size();
+    if (cache.valid &&
+        cache.inputPath == inputPath &&
+        cache.lastModifiedUtc == lastModifiedUtc &&
+        cache.fileSize == fileSize) {
+        return true;
+    }
+
+    CfaPreviewCache rebuilt;
+    rebuilt.inputPath = inputPath;
+    rebuilt.lastModifiedUtc = lastModifiedUtc;
+    rebuilt.fileSize = fileSize;
+
+    int rWidth = 0;
+    int rHeight = 0;
+    int rBitDepth = 0;
+    SuperCCDMetadata rMetadata;
+    QString sError;
+    QString rError;
+    std::future<bool> sRead = std::async(
+        std::launch::async,
+        [&]() {
+            return readSelectedShotCfa(inputPath,
+                                       0,
+                                       false,
+                                       rebuilt.sCfa,
+                                       rebuilt.width,
+                                       rebuilt.height,
+                                       rebuilt.bitDepth,
+                                       rebuilt.metadata,
+                                       &rebuilt.sChannels,
+                                       sError);
+        });
+    const bool rRead = readSelectedShotCfa(inputPath,
+                                          1,
+                                          false,
+                                          rebuilt.rCfa,
+                                          rWidth,
+                                          rHeight,
+                                          rBitDepth,
+                                          rMetadata,
+                                          &rebuilt.rChannels,
+                                          rError);
+    const bool sReadSucceeded = sRead.get();
+    if (!sReadSucceeded) {
+        error = sError;
+        return false;
+    }
+    if (!rRead) {
+        error = rError;
+        return false;
+    }
+    if (rebuilt.bitDepth != rBitDepth) {
+        error = QStringLiteral("S and R bit depths do not match.");
+        return false;
+    }
+
+    std::vector<uint16_t> alignedRCfa;
+    std::vector<uint8_t> canonicalChannels;
+    superccd::CfaPlaneAlignmentInfo alignmentInfo;
+    std::string alignmentError;
+    if (!superccd::alignSecondaryCfaToPrimary(
+            rebuilt.sCfa,
+            rebuilt.sChannels,
+            rebuilt.width,
+            rebuilt.height,
+            rebuilt.metadata.fujiWidth,
+            rebuilt.rCfa,
+            rebuilt.rChannels,
+            rWidth,
+            rHeight,
+            rMetadata.fujiWidth,
+            alignedRCfa,
+            canonicalChannels,
+            alignmentInfo,
+            alignmentError)) {
+        error = QStringLiteral(
+                    "Unable to align S and R canvases without changing the CFA: %1")
+                    .arg(QString::fromStdString(alignmentError));
+        return false;
+    }
+
+    logProcessing(
+        "S/R CFA alignment: S=%dx%d fujiWidth=%d R=%dx%d fujiWidth=%d "
+        "offset=(%d,%d) metadata=%d colorMatch=%.6f corr=%.6f "
+        "extrapolated=%zu dropped=%zu",
+        rebuilt.width,
+        rebuilt.height,
+        rebuilt.metadata.fujiWidth,
+        rWidth,
+        rHeight,
+        rMetadata.fujiWidth,
+        alignmentInfo.offsetX,
+        alignmentInfo.offsetY,
+        alignmentInfo.usedMetadataOffset ? 1 : 0,
+        alignmentInfo.colorMatchRatio,
+        alignmentInfo.correlation,
+        alignmentInfo.extrapolatedSamples,
+        alignmentInfo.droppedSourceSamples);
+
+    rebuilt.rCfa = std::move(alignedRCfa);
+    rebuilt.sChannels = canonicalChannels;
+    rebuilt.rChannels = std::move(canonicalChannels);
+
+    // Upsample both S and R to 2x resolution using same-color neighbors
+    // This avoids boundary artifacts from offset-based projection
+    // After upsampling, S and R will be at corresponding positions - no offset needed
+    QString sUpsampleLog, rUpsampleLog;
+    if (!interpolateCfaToFullResolution(rebuilt.sCfa, rebuilt.sChannels,
+                                       rebuilt.width, rebuilt.height,
+                                       rebuilt.sUpsampled, sUpsampleLog)) {
+        error = QStringLiteral("Failed to interpolate S CFA to full resolution.");
+        return false;
+    }
+    if (!interpolateCfaToFullResolution(rebuilt.rCfa, rebuilt.rChannels,
+                                       rebuilt.width, rebuilt.height,
+                                       rebuilt.rUpsampled, rUpsampleLog)) {
+        error = QStringLiteral("Failed to interpolate R CFA to full resolution.");
+        return false;
+    }
+    rebuilt.upsampledWidth = rebuilt.width;
+    rebuilt.upsampledHeight = rebuilt.height;
+
+    QImage embeddedThumb;
+    if (extractEmbeddedThumbnail(inputPath, embeddedThumb, nullptr)) {
+        rebuilt.metadata.embeddedThumbnail = embeddedThumb;
+    }
+
+    rebuilt.valid = true;
+    cache = std::move(rebuilt);
+    return true;
+}
+
+bool SuperCCDProcessor::readSelectedShotCfa(const QString &inputPath,
+                                            int shotSelect,
+                                            bool output12MP,
+                                            std::vector<uint16_t> &cfaData,
+                                            int &width,
+                                            int &height,
+                                            int &bitDepth,
+                                            SuperCCDMetadata &metadata,
+                                            std::vector<uint8_t> *channelMap,
+                                            QString &error)
+{
+    logProcessing("readSelectedShotCfa open_file: %s shot=%d",
+                  inputPath.toUtf8().constData(),
+                  shotSelect);
+
+    // This reader runs concurrently for the S and R shots. A stack-allocated
+    // LibRaw exceeds the default macOS worker-thread stack.
+    auto rawStorage = std::make_unique<LibRaw>();
+    LibRaw &raw = *rawStorage;
+    raw.imgdata.rawparams.shot_select = static_cast<unsigned>(shotSelect);
+
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    logProcessing("readSelectedShotCfa identified: shot=%d raw_count=%u width=%u height=%u maximum=%u",
+                  shotSelect,
+                  raw.imgdata.idata.raw_count,
+                  raw.imgdata.sizes.width,
+                  raw.imgdata.sizes.height,
+                  raw.imgdata.color.maximum);
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    metadata.fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm localTime {};
+#ifdef _WIN32
+        localtime_s(&localTime, &raw.imgdata.other.timestamp);
+#else
+        localtime_r(&raw.imgdata.other.timestamp, &localTime);
+#endif
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", &localTime);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    populateBasicMetadata(raw, metadata);
+
+    if (raw.imgdata.rawdata.raw_image == nullptr) {
+        error = QStringLiteral("Unable to access native raw image buffer.");
+        return false;
+    }
+
+    metadata.whiteLevel = static_cast<uint16_t>(std::min<unsigned>(raw.imgdata.color.maximum, 65535u));
+
+    const auto &color = raw.imgdata.color;
+    const auto &dngLevels = raw.imgdata.color.dng_levels;
+    const double blackR = dngLevels.dng_black ? static_cast<double>(dngLevels.dng_black)
+                                              : static_cast<double>(color.cblack[0] ? color.cblack[0] : color.black);
+    const double blackG2 = dngLevels.dng_black ? static_cast<double>(dngLevels.dng_black)
+                                               : static_cast<double>(color.cblack[1] ? color.cblack[1] : color.black);
+    const double blackB = dngLevels.dng_black ? static_cast<double>(dngLevels.dng_black)
+                                              : static_cast<double>(color.cblack[2] ? color.cblack[2] : color.black);
+    const double blackG1 = dngLevels.dng_black ? static_cast<double>(dngLevels.dng_black)
+                                               : static_cast<double>(color.cblack[3] ? color.cblack[3] : color.black);
+    metadata.blackLevels = {blackG1, blackB, blackR, blackG2};
+    metadata.hasBlackLevels = (blackG1 > 0.0 || blackB > 0.0 || blackR > 0.0 || blackG2 > 0.0);
+
+    double neutralR = 0.0;
+    double neutralG = 0.0;
+    double neutralB = 0.0;
+    if (color.cam_mul[0] > 0.0f && color.cam_mul[1] > 0.0f && color.cam_mul[2] > 0.0f) {
+        neutralR = 1.0 / static_cast<double>(color.cam_mul[0]);
+        const double neutralG1 = 1.0 / static_cast<double>(color.cam_mul[1]);
+        neutralB = 1.0 / static_cast<double>(color.cam_mul[2]);
+        const double g2Mul = color.cam_mul[3] > 0.0f ? color.cam_mul[3] : color.cam_mul[1];
+        const double neutralG2 = 1.0 / static_cast<double>(g2Mul);
+        neutralG = 0.5 * (neutralG1 + neutralG2);
+    }
+    if (neutralR > 0.0 && neutralG > 0.0 && neutralB > 0.0) {
+        const double scale = 1.0 / neutralG;
+        metadata.asShotNeutral = {neutralR * scale, 1.0, neutralB * scale};
+        metadata.hasAsShotNeutral = true;
+        // Compute tint from G1 vs G2 difference: positive = green cast, negative = magenta cast
+        const double neutralG1 = 1.0 / static_cast<double>(color.cam_mul[1]);
+        const double g2Mul = color.cam_mul[3] > 0.0f ? color.cam_mul[3] : color.cam_mul[1];
+        const double neutralG2 = 1.0 / static_cast<double>(g2Mul);
+        metadata.asShotTint = (neutralG2 > 0.0) ? ((neutralG1 - neutralG2) / neutralG2) * 100.0 : 0.0;
+        logProcessing("AsShotNeutral extracted: cam_mul[0]=%.4f [1]=%.4f [2]=%.4f [3]=%.4f -> neutral R=%.4f G=%.4f B=%.4f -> asShotNeutral={%.4f, 1.0, %.4f} tint=%.2f",
+                      color.cam_mul[0], color.cam_mul[1], color.cam_mul[2], color.cam_mul[3],
+                      neutralR, neutralG, neutralB,
+                      metadata.asShotNeutral[0], metadata.asShotNeutral[2],
+                      metadata.asShotTint);
+    }
+
+    bool hasColorMatrix = false;
+    std::array<double, 9> collapsedColorMatrix = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
+    const bool haveDngColor = raw.imgdata.color.dng_color[0].parsedfields != 0;
+    if (haveDngColor) {
+        for (int xyz = 0; xyz < 3; ++xyz) {
+            collapsedColorMatrix[xyz + 0] = static_cast<double>(raw.imgdata.color.dng_color[0].colormatrix[0][xyz]);
+            collapsedColorMatrix[xyz + 3] = 0.5 * (
+                static_cast<double>(raw.imgdata.color.dng_color[0].colormatrix[1][xyz]) +
+                static_cast<double>(raw.imgdata.color.dng_color[0].colormatrix[3][xyz]));
+            collapsedColorMatrix[xyz + 6] = static_cast<double>(raw.imgdata.color.dng_color[0].colormatrix[2][xyz]);
+        }
+        hasColorMatrix = true;
+    } else {
+        bool anyCamXyz = false;
+        for (int row = 0; row < 4; ++row) {
+            for (int xyz = 0; xyz < 3; ++xyz) {
+                if (std::abs(static_cast<double>(color.cam_xyz[row][xyz])) > 1e-6) {
+                    anyCamXyz = true;
+                    break;
+                }
+            }
+            if (anyCamXyz) {
+                break;
+            }
+        }
+        if (anyCamXyz) {
+            for (int xyz = 0; xyz < 3; ++xyz) {
+                collapsedColorMatrix[xyz + 0] = static_cast<double>(color.cam_xyz[0][xyz]);
+                collapsedColorMatrix[xyz + 3] = 0.5 * (
+                    static_cast<double>(color.cam_xyz[1][xyz]) +
+                    static_cast<double>(color.cam_xyz[3][xyz]));
+                collapsedColorMatrix[xyz + 6] = static_cast<double>(color.cam_xyz[2][xyz]);
+            }
+            hasColorMatrix = true;
+        }
+    }
+    metadata.colorMatrix1 = collapsedColorMatrix;
+    metadata.hasColorMatrix1 = hasColorMatrix;
+
+    // Extract FujiCurve tone curve (65536 entries of 16-bit values)
+    bool hasCurveData = false;
+    metadata.curve.resize(65536);
+    for (int i = 0; i < 65536; ++i) {
+        if (raw.imgdata.color.curve[i] != i) {  // curve is initialized to identity
+            metadata.curve.data()[i] = raw.imgdata.color.curve[i];
+            hasCurveData = true;
+        } else {
+            metadata.curve.data()[i] = static_cast<unsigned short>(i);
+        }
+    }
+    metadata.hasCurve = hasCurveData;
+    if (hasCurveData) {
+        logProcessing("FujiCurve extracted: curve identity=%s", hasCurveData ? "no" : "yes");
+    }
+
+    logProcessing("selected shot metadata: shot=%d white=%u black=[%.2f %.2f %.2f %.2f] neutral=[%.5f %.5f %.5f] colorMatrix=%d curve=%d",
+                  shotSelect,
+                  metadata.whiteLevel,
+                  metadata.blackLevels[0],
+                  metadata.blackLevels[1],
+                  metadata.blackLevels[2],
+                  metadata.blackLevels[3],
+                  metadata.asShotNeutral[0],
+                  metadata.asShotNeutral[1],
+                  metadata.asShotNeutral[2],
+                  metadata.hasColorMatrix1 ? 1 : 0,
+                  metadata.hasCurve ? 1 : 0);
+
+    result = raw.raw2image();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.image == nullptr) {
+        error = QStringLiteral("Unable to access Fuji-rotated image buffer.");
+        return false;
+    }
+
+    bitDepth = 16;
+
+    if (!output12MP) {
+        width = raw.imgdata.sizes.iwidth;
+        height = raw.imgdata.sizes.iheight;
+        if (width <= 0 || height <= 0) {
+            error = QStringLiteral("Invalid rotated image dimensions for selected shot.");
+            return false;
+        }
+
+        cfaData.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+        if (channelMap) {
+            channelMap->assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0xFF);
+        }
+
+        uint16_t minValue = 65535;
+        uint16_t maxValue = 0;
+        uint64_t nonZero = 0;
+        const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+        for (size_t i = 0; i < pixelCount; ++i) {
+            uint16_t value = 0;
+            for (int c = 0; c < 4; ++c) {
+                const uint16_t sample = raw.imgdata.image[i][c];
+                if (sample != 0) {
+                    value = sample;
+                    if (channelMap) {
+                        (*channelMap)[i] = static_cast<uint8_t>(c);
+                    }
+                    break;
+                }
+            }
+
+            if (value != 0) {
+                nonZero++;
+                if (value < minValue) minValue = value;
+                if (value > maxValue) maxValue = value;
+            }
+            cfaData[i] = value;
+        }
+
+        logProcessing("readSelectedShotCfa completed: shot=%d mode=6MP width=%d height=%d nonZero=%llu range=%u..%u",
+                      shotSelect,
+                      width,
+                      height,
+                      static_cast<unsigned long long>(nonZero),
+                      minValue,
+                      maxValue);
+        return true;
+    }
+
+    const int activeW = raw.imgdata.sizes.width;
+    const int activeH = raw.imgdata.sizes.height;
+    const int analysisWidth = activeW - (activeW % 2);
+    const int analysisHeight = activeH - (activeH % 2);
+    const int fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+    int minDiagX = INT_MAX;
+    int minDiagY = INT_MAX;
+    int maxDiagX = -1;
+    int maxDiagY = -1;
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(activeW) + static_cast<size_t>(x);
+            for (int c = 0; c < 4; ++c) {
+                if (raw.imgdata.image[srcIdx][c] == 0) {
+                    continue;
+                }
+                const int diagX = (x + y) >> 1;
+                const int diagY = ((y - x) >> 1) + fujiWidth;
+                if (diagX < minDiagX) minDiagX = diagX;
+                if (diagY < minDiagY) minDiagY = diagY;
+                if (diagX > maxDiagX) maxDiagX = diagX;
+                if (diagY > maxDiagY) maxDiagY = diagY;
+            }
+        }
+    }
+
+    if (minDiagX > maxDiagX || minDiagY > maxDiagY) {
+        error = QStringLiteral("Unable to derive 12MP SuperCCD bounds.");
+        return false;
+    }
+
+    const int diagWidth = maxDiagX - minDiagX + 1;
+    const int diagHeight = maxDiagY - minDiagY + 1;
+    const int planeWidth = ((diagWidth + 1) / 2) * 2;
+    const int compactPlaneWidth = planeWidth / 2;
+    std::vector<uint16_t> compactG1(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactR(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactB(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint16_t> compactG2(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskG1(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskR(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskB(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    std::vector<uint8_t> maskG2(static_cast<size_t>(compactPlaneWidth) * static_cast<size_t>(diagHeight));
+    uint64_t packed = 0;
+    uint64_t collisions = 0;
+    uint64_t paritySkips = 0;
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(activeW) + static_cast<size_t>(x);
+            const int diagX = ((x + y) >> 1) - minDiagX;
+            const int diagY = (((y - x) >> 1) + fujiWidth) - minDiagY;
+            if (diagX < 0 || diagX >= diagWidth || diagY < 0 || diagY >= diagHeight) {
+                continue;
+            }
+
+            for (int c = 0; c < 4; ++c) {
+                const uint16_t sample = raw.imgdata.image[srcIdx][c];
+                if (sample == 0) {
+                    continue;
+                }
+
+                const int rowParity = diagY & 1;
+                std::vector<uint16_t> *plane = nullptr;
+                std::vector<uint8_t> *mask = nullptr;
+                int phaseBase = 0;
+                switch (c) {
+                case 3:
+                    plane = &compactG1;
+                    mask = &maskG1;
+                    phaseBase = 1;
+                    break;
+                case 2:
+                    plane = &compactB;
+                    mask = &maskB;
+                    phaseBase = 0;
+                    break;
+                case 0:
+                    plane = &compactR;
+                    mask = &maskR;
+                    phaseBase = 1;
+                    break;
+                case 1:
+                    plane = &compactG2;
+                    mask = &maskG2;
+                    phaseBase = 0;
+                    break;
+                default:
+                    continue;
+                }
+
+                const int expectedParity = ((rowParity & 1) == 0) ? phaseBase : (1 - phaseBase);
+                if ((diagX & 1) != expectedParity) {
+                    paritySkips++;
+                    continue;
+                }
+
+                const int compactX = (diagX - expectedParity) / 2;
+                if (compactX < 0 || compactX >= compactPlaneWidth) {
+                    continue;
+                }
+
+                const size_t dstIdx = static_cast<size_t>(diagY) * static_cast<size_t>(compactPlaneWidth) +
+                                      static_cast<size_t>(compactX);
+                if ((*mask)[dstIdx]) {
+                    collisions++;
+                }
+                (*plane)[dstIdx] = sample;
+                (*mask)[dstIdx] = 1;
+                packed++;
+            }
+        }
+    }
+
+    std::vector<uint16_t> planeG1;
+    std::vector<uint16_t> planeR;
+    std::vector<uint16_t> planeB;
+    std::vector<uint16_t> planeG2;
+    expandDiagonalPlane(compactG1, maskG1, compactPlaneWidth, diagHeight, 1, planeG1, planeWidth);
+    expandDiagonalPlane(compactR, maskR, compactPlaneWidth, diagHeight, 1, planeR, planeWidth);
+    expandDiagonalPlane(compactB, maskB, compactPlaneWidth, diagHeight, 0, planeB, planeWidth);
+    expandDiagonalPlane(compactG2, maskG2, compactPlaneWidth, diagHeight, 0, planeG2, planeWidth);
+
+    width = planeWidth * 2;
+    height = diagHeight * 2;
+    cfaData.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+    if (channelMap) {
+        channelMap->assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0xFF);
+    }
+
+    uint16_t minValue = 65535;
+    uint16_t maxValue = 0;
+    for (int py = 0; py < diagHeight; ++py) {
+        for (int px = 0; px < planeWidth; ++px) {
+            const size_t planeIdx = static_cast<size_t>(py) * static_cast<size_t>(planeWidth) +
+                                    static_cast<size_t>(px);
+            const size_t row0 = static_cast<size_t>(py * 2) * static_cast<size_t>(width);
+            const size_t row1 = static_cast<size_t>(py * 2 + 1) * static_cast<size_t>(width);
+            cfaData[row0 + static_cast<size_t>(px * 2)] = planeG1[planeIdx];
+            cfaData[row0 + static_cast<size_t>(px * 2 + 1)] = planeB[planeIdx];
+            cfaData[row1 + static_cast<size_t>(px * 2)] = planeR[planeIdx];
+            cfaData[row1 + static_cast<size_t>(px * 2 + 1)] = planeG2[planeIdx];
+            if (channelMap) {
+                (*channelMap)[row0 + static_cast<size_t>(px * 2)] = 3;
+                (*channelMap)[row0 + static_cast<size_t>(px * 2 + 1)] = 2;
+                (*channelMap)[row1 + static_cast<size_t>(px * 2)] = 0;
+                (*channelMap)[row1 + static_cast<size_t>(px * 2 + 1)] = 1;
+            }
+            const uint16_t blockValues[4] = {
+                planeG1[planeIdx], planeB[planeIdx], planeR[planeIdx], planeG2[planeIdx]
+            };
+            for (uint16_t value : blockValues) {
+                if (value == 0) {
+                    continue;
+                }
+                if (value < minValue) minValue = value;
+                if (value > maxValue) maxValue = value;
+            }
+        }
+    }
+
+    logProcessing("readSelectedShotCfa completed: shot=%d mode=12MP width=%d height=%d packed=%llu collisions=%llu paritySkips=%llu range=%u..%u",
+                  shotSelect,
+                  width,
+                  height,
+                  static_cast<unsigned long long>(packed),
+                  static_cast<unsigned long long>(collisions),
+                  static_cast<unsigned long long>(paritySkips),
+                  minValue,
+                  maxValue);
+    return true;
+}
+
+bool SuperCCDProcessor::readNativeRawPartitionRgb(const QString &inputPath,
+                                                  int partitionMode,
+                                                  int partitionClass,
+                                                  std::vector<uint16_t> &rgbData,
+                                                  int &width,
+                                                  int &height,
+                                                  int &bitDepth,
+                                                  SuperCCDMetadata &metadata,
+                                                  QString &error)
+{
+    logProcessing("readNativeRawPartitionRgb open_file: %s mode=%d class=%d",
+                  inputPath.toUtf8().constData(),
+                  partitionMode,
+                  partitionClass);
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.rawdata.raw_image == nullptr) {
+        error = QStringLiteral("Unable to access native raw image buffer.");
+        return false;
+    }
+
+    const int rawWidth = raw.imgdata.rawdata.sizes.raw_width;
+    const int rawHeight = raw.imgdata.rawdata.sizes.raw_height;
+    const int topMargin = raw.imgdata.sizes.top_margin;
+    const int leftMargin = raw.imgdata.sizes.left_margin;
+    const int visibleWidth = rawWidth - (leftMargin * 2);
+    const int visibleHeight = rawHeight - (topMargin * 2);
+    if (visibleWidth <= 0 || visibleHeight <= 0) {
+        error = QStringLiteral("Invalid visible raw dimensions.");
+        return false;
+    }
+
+    if (partitionMode == 0 && partitionClass == 0) {
+        logNativePairDirectionStats(raw.imgdata.rawdata.raw_image,
+                                    rawWidth,
+                                    leftMargin,
+                                    topMargin,
+                                    visibleWidth,
+                                    visibleHeight);
+        logProcessing("Entering same-color pair stats");
+        logNativeSameColorPairDirectionStats(raw,
+                                             raw.imgdata.rawdata.raw_image,
+                                             rawWidth,
+                                             leftMargin,
+                                             topMargin,
+                                             visibleWidth,
+                                             visibleHeight);
+        logProcessing("Leaving same-color pair stats");
+    }
+
+    std::vector<uint16_t> plane(static_cast<size_t>(visibleWidth) * static_cast<size_t>(visibleHeight));
+    std::vector<uint8_t> mask(static_cast<size_t>(visibleWidth) * static_cast<size_t>(visibleHeight));
+    uint64_t packed = 0;
+    uint64_t nonZero = 0;
+
+    for (int y = 0; y < visibleHeight; ++y) {
+        for (int x = 0; x < visibleWidth; ++x) {
+            const int rawRow = y + topMargin;
+            const int rawCol = x + leftMargin;
+            const size_t rawIdx = static_cast<size_t>(rawRow) * static_cast<size_t>(rawWidth) +
+                                  static_cast<size_t>(rawCol);
+            const uint16_t sample = raw.imgdata.rawdata.raw_image[rawIdx];
+            if (sample == 0) {
+                continue;
+            }
+            nonZero++;
+
+            bool selected = false;
+            if (partitionMode == 0) {
+                selected = ((y & 1) == partitionClass);
+            } else {
+                selected = (((x + y) & 1) == partitionClass);
+            }
+
+            if (!selected) {
+                continue;
+            }
+
+            const size_t dstIdx = static_cast<size_t>(y) * static_cast<size_t>(visibleWidth) +
+                                  static_cast<size_t>(x);
+            plane[dstIdx] = sample;
+            mask[dstIdx] = 1;
+            packed++;
+        }
+    }
+
+    width = visibleWidth;
+    height = visibleHeight;
+    bitDepth = 16;
+    rgbData.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+    for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+        const uint16_t value = plane[i];
+        rgbData[i * 3 + 0] = value;
+        rgbData[i * 3 + 1] = value;
+        rgbData[i * 3 + 2] = value;
+    }
+
+    logProcessing("readNativeRawPartitionRgb completed: mode=%d class=%d width=%d height=%d packed=%llu nonZero=%llu",
+                  partitionMode,
+                  partitionClass,
+                  width,
+                  height,
+                  static_cast<unsigned long long>(packed),
+                  static_cast<unsigned long long>(nonZero));
+    return true;
+}
+
+bool SuperCCDProcessor::readNativeVerticalPairRgb(const QString &inputPath,
+                                                  bool brighterSample,
+                                                  int columnParity,
+                                                  std::vector<uint16_t> &rgbData,
+                                                  int &width,
+                                                  int &height,
+                                                  int &bitDepth,
+                                                  SuperCCDMetadata &metadata,
+                                                  QString &error)
+{
+    logProcessing("readNativeVerticalPairRgb open_file: %s brighter=%d columnParity=%d",
+                  inputPath.toUtf8().constData(),
+                  brighterSample ? 1 : 0,
+                  columnParity);
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.rawdata.raw_image == nullptr) {
+        error = QStringLiteral("Unable to access native raw image buffer.");
+        return false;
+    }
+
+    const int rawWidth = raw.imgdata.rawdata.sizes.raw_width;
+    const int rawHeight = raw.imgdata.rawdata.sizes.raw_height;
+    const int topMargin = raw.imgdata.sizes.top_margin;
+    const int leftMargin = raw.imgdata.sizes.left_margin;
+    const int visibleWidth = rawWidth - (leftMargin * 2);
+    const int visibleHeight = rawHeight - (topMargin * 2);
+    if (visibleWidth <= 0 || visibleHeight < 2) {
+        error = QStringLiteral("Invalid visible raw dimensions for vertical pairing.");
+        return false;
+    }
+
+    if (columnParity < 0 || columnParity > 1) {
+        error = QStringLiteral("Invalid column parity for vertical pairing.");
+        return false;
+    }
+
+    width = visibleWidth / 2;
+    height = visibleHeight / 2;
+    bitDepth = 16;
+    std::vector<uint16_t> plane(static_cast<size_t>(width) * static_cast<size_t>(height));
+    uint64_t pairCount = 0;
+
+    for (int outY = 0; outY < height; ++outY) {
+        const int y0 = outY * 2;
+        const int y1 = y0 + 1;
+        for (int outX = 0; outX < width; ++outX) {
+            const int x = outX * 2 + columnParity;
+            const int rawRowA = y0 + topMargin;
+            const int rawRowB = y1 + topMargin;
+            const int rawCol = x + leftMargin;
+            const uint16_t a = raw.imgdata.rawdata.raw_image[static_cast<size_t>(rawRowA) * static_cast<size_t>(rawWidth) +
+                                                             static_cast<size_t>(rawCol)];
+            const uint16_t b = raw.imgdata.rawdata.raw_image[static_cast<size_t>(rawRowB) * static_cast<size_t>(rawWidth) +
+                                                             static_cast<size_t>(rawCol)];
+            if (a == 0 || b == 0) {
+                continue;
+            }
+
+            plane[static_cast<size_t>(outY) * static_cast<size_t>(width) + static_cast<size_t>(outX)] =
+                brighterSample ? (a > b ? a : b) : (a < b ? a : b);
+            pairCount++;
+        }
+    }
+
+    rgbData.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+    for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+        const uint16_t value = plane[i];
+        rgbData[i * 3 + 0] = value;
+        rgbData[i * 3 + 1] = value;
+        rgbData[i * 3 + 2] = value;
+    }
+
+    logProcessing("readNativeVerticalPairRgb completed: brighter=%d columnParity=%d width=%d height=%d pairs=%llu",
+                  brighterSample ? 1 : 0,
+                  columnParity,
+                  width,
+                  height,
+                  static_cast<unsigned long long>(pairCount));
+    return true;
+}
+
+bool SuperCCDProcessor::readNativeSameColorPairRgb(const QString &inputPath,
+                                                   int dx,
+                                                   int dy,
+                                                   bool brighterSample,
+                                                   std::vector<uint16_t> &rgbData,
+                                                   int &width,
+                                                   int &height,
+                                                   int &bitDepth,
+                                                   SuperCCDMetadata &metadata,
+                                                   QString &error)
+{
+    logProcessing("readNativeSameColorPairRgb open_file: %s dx=%d dy=%d brighter=%d",
+                  inputPath.toUtf8().constData(),
+                  dx,
+                  dy,
+                  brighterSample ? 1 : 0);
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.rawdata.raw_image == nullptr) {
+        error = QStringLiteral("Unable to access native raw image buffer.");
+        return false;
+    }
+
+    const int rawWidth = raw.imgdata.rawdata.sizes.raw_width;
+    const int rawHeight = raw.imgdata.rawdata.sizes.raw_height;
+    const int topMargin = raw.imgdata.sizes.top_margin;
+    const int leftMargin = raw.imgdata.sizes.left_margin;
+    const int visibleWidth = rawWidth - (leftMargin * 2);
+    const int visibleHeight = rawHeight - (topMargin * 2);
+    const int outWidth = visibleWidth - std::abs(dx);
+    const int outHeight = visibleHeight - std::abs(dy);
+    if (outWidth <= 0 || outHeight <= 0) {
+        error = QStringLiteral("Invalid same-color pair output dimensions.");
+        return false;
+    }
+
+    width = outWidth;
+    height = outHeight;
+    bitDepth = 16;
+    std::vector<uint16_t> plane(static_cast<size_t>(width) * static_cast<size_t>(height));
+    uint64_t pairCount = 0;
+
+    const int startX = dx < 0 ? -dx : 0;
+    const int startY = dy < 0 ? -dy : 0;
+    for (int outY = 0; outY < outHeight; ++outY) {
+        const int y = startY + outY;
+        const int ny = y + dy;
+        for (int outX = 0; outX < outWidth; ++outX) {
+            const int x = startX + outX;
+            const int nx = x + dx;
+
+            const int rawRowA = y + topMargin;
+            const int rawColA = x + leftMargin;
+            const int rawRowB = ny + topMargin;
+            const int rawColB = nx + leftMargin;
+            const int colorA = raw.COLOR(rawRowA, rawColA);
+            const int colorB = raw.COLOR(rawRowB, rawColB);
+            if (colorA != colorB) {
+                continue;
+            }
+
+            const uint16_t a = raw.imgdata.rawdata.raw_image[static_cast<size_t>(rawRowA) * static_cast<size_t>(rawWidth) +
+                                                             static_cast<size_t>(rawColA)];
+            const uint16_t b = raw.imgdata.rawdata.raw_image[static_cast<size_t>(rawRowB) * static_cast<size_t>(rawWidth) +
+                                                             static_cast<size_t>(rawColB)];
+            if (a == 0 || b == 0) {
+                continue;
+            }
+
+            plane[static_cast<size_t>(outY) * static_cast<size_t>(width) + static_cast<size_t>(outX)] =
+                brighterSample ? (a > b ? a : b) : (a < b ? a : b);
+            pairCount++;
+        }
+    }
+
+    rgbData.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+    for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+        const uint16_t value = plane[i];
+        rgbData[i * 3 + 0] = value;
+        rgbData[i * 3 + 1] = value;
+        rgbData[i * 3 + 2] = value;
+    }
+
+    logProcessing("readNativeSameColorPairRgb completed: dx=%d dy=%d brighter=%d width=%d height=%d pairs=%llu",
+                  dx,
+                  dy,
+                  brighterSample ? 1 : 0,
+                  width,
+                  height,
+                  static_cast<unsigned long long>(pairCount));
+    return true;
+}
+
+bool SuperCCDProcessor::readProcessedRgb(const QString &inputPath,
+                                         std::vector<uint16_t> &rgbData,
+                                         int &width,
+                                         int &height,
+                                         int &bitDepth,
+                                         SuperCCDMetadata &metadata,
+                                         QString &error)
+{
+    logProcessing("readProcessedRgb open_file: %s", inputPath.toUtf8().constData());
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    raw.imgdata.params.output_bps = 16;
+    raw.imgdata.params.use_camera_wb = 1;
+    raw.imgdata.params.no_auto_bright = 1;
+    raw.imgdata.params.no_auto_scale = 1;
+    raw.imgdata.params.bright = 1.0f;
+    raw.imgdata.params.gamm[0] = 1.0;
+    raw.imgdata.params.gamm[1] = 1.0;
+    raw.imgdata.params.output_color = 1;
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        logProcessing("processed unpack error %d: %s", result, error.toUtf8().constData());
+        return false;
+    }
+
+    result = raw.dcraw_process();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        logProcessing("dcraw_process error %d: %s", result, error.toUtf8().constData());
+        return false;
+    }
+
+    int imageError = LIBRAW_SUCCESS;
+    libraw_processed_image_t *image = raw.dcraw_make_mem_image(&imageError);
+    if (!image) {
+        error = QString::fromUtf8(libraw_strerror(imageError));
+        logProcessing("dcraw_make_mem_image failed %d: %s", imageError, error.toUtf8().constData());
+        return false;
+    }
+
+    width = static_cast<int>(image->width);
+    height = static_cast<int>(image->height);
+    bitDepth = 16;
+
+    if (image->type != LIBRAW_IMAGE_BITMAP || image->colors < 3 || width <= 0 || height <= 0) {
+        raw.dcraw_clear_mem(image);
+        error = QStringLiteral("LibRaw did not return a usable RGB image.");
+        return false;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    rgbData.resize(pixelCount * 3);
+
+    if (image->bits == 16) {
+        const uint16_t *src = reinterpret_cast<const uint16_t *>(image->data);
+        for (size_t i = 0; i < pixelCount; ++i) {
+            rgbData[i * 3 + 0] = src[i * image->colors + 0];
+            rgbData[i * 3 + 1] = src[i * image->colors + 1];
+            rgbData[i * 3 + 2] = src[i * image->colors + 2];
+        }
+    } else if (image->bits == 8) {
+        const uint8_t *src = image->data;
+        for (size_t i = 0; i < pixelCount; ++i) {
+            rgbData[i * 3 + 0] = static_cast<uint16_t>(src[i * image->colors + 0]) * 257u;
+            rgbData[i * 3 + 1] = static_cast<uint16_t>(src[i * image->colors + 1]) * 257u;
+            rgbData[i * 3 + 2] = static_cast<uint16_t>(src[i * image->colors + 2]) * 257u;
+        }
+    } else {
+        raw.dcraw_clear_mem(image);
+        error = QStringLiteral("Unsupported LibRaw RGB bit depth.");
+        return false;
+    }
+
+    uint16_t minValue[3] = {65535, 65535, 65535};
+    uint16_t maxValue[3] = {0, 0, 0};
+    for (size_t i = 0; i < pixelCount; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            const uint16_t value = rgbData[i * 3 + static_cast<size_t>(c)];
+            if (value < minValue[c]) minValue[c] = value;
+            if (value > maxValue[c]) maxValue[c] = value;
+        }
+    }
+
+    logProcessing("readProcessedRgb completed: width=%d height=%d colors=%d bits=%d",
+                  width, height, image->colors, image->bits);
+    logProcessing("readProcessedRgb channel range: R=%u..%u G=%u..%u B=%u..%u",
+                  minValue[0], maxValue[0],
+                  minValue[1], maxValue[1],
+                  minValue[2], maxValue[2]);
+    raw.dcraw_clear_mem(image);
+    return true;
+}
+
+bool SuperCCDProcessor::readLinearPlaneRgb(const QString &inputPath,
+                                           int planeChannel,
+                                           std::vector<uint16_t> &rgbData,
+                                           int &width,
+                                           int &height,
+                                           int &bitDepth,
+                                           SuperCCDMetadata &metadata,
+                                           QString &error)
+{
+    logProcessing("readLinearPlaneRgb open_file: %s plane=%d", inputPath.toUtf8().constData(), planeChannel);
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    if (raw.imgdata.image == nullptr) {
+        result = raw.raw2image();
+        if (result != LIBRAW_SUCCESS) {
+            error = QString::fromUtf8(libraw_strerror(result));
+            return false;
+        }
+    }
+
+    if (raw.imgdata.image == nullptr) {
+        error = QStringLiteral("Unable to access raw image buffer.");
+        return false;
+    }
+
+    const int activeW = raw.imgdata.sizes.width;
+    const int activeH = raw.imgdata.sizes.height;
+    const int analysisWidth = activeW - (activeW % 2);
+    const int analysisHeight = activeH - (activeH % 2);
+    const int fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+
+    int minDiagX = INT_MAX;
+    int minDiagY = INT_MAX;
+    int maxDiagX = -1;
+    int maxDiagY = -1;
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(analysisWidth) + static_cast<size_t>(x);
+            if (srcIdx >= static_cast<size_t>(activeW) * static_cast<size_t>(activeH)) {
+                continue;
+            }
+            if (raw.imgdata.image[srcIdx][planeChannel] == 0) {
+                continue;
+            }
+
+            const int diagX = (x + y) >> 1;
+            const int diagY = ((y - x) >> 1) + fujiWidth;
+            if (diagX < minDiagX) minDiagX = diagX;
+            if (diagY < minDiagY) minDiagY = diagY;
+            if (diagX > maxDiagX) maxDiagX = diagX;
+            if (diagY > maxDiagY) maxDiagY = diagY;
+        }
+    }
+
+    if (minDiagX > maxDiagX || minDiagY > maxDiagY) {
+        error = QStringLiteral("Selected raw plane is empty.");
+        return false;
+    }
+
+    const int planeWidth = maxDiagX - minDiagX + 1;
+    const int planeHeight = maxDiagY - minDiagY + 1;
+    std::vector<uint16_t> plane(static_cast<size_t>(planeWidth) * static_cast<size_t>(planeHeight));
+    std::vector<uint8_t> mask(static_cast<size_t>(planeWidth) * static_cast<size_t>(planeHeight));
+    uint64_t packed = 0;
+    uint64_t collisions = 0;
+
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < analysisWidth; ++x) {
+            const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(analysisWidth) + static_cast<size_t>(x);
+            if (srcIdx >= static_cast<size_t>(activeW) * static_cast<size_t>(activeH)) {
+                continue;
+            }
+
+            const uint16_t sample = raw.imgdata.image[srcIdx][planeChannel];
+            if (sample == 0) {
+                continue;
+            }
+
+            const int diagX = ((x + y) >> 1) - minDiagX;
+            const int diagY = (((y - x) >> 1) + fujiWidth) - minDiagY;
+            const size_t dstIdx = static_cast<size_t>(diagY) * static_cast<size_t>(planeWidth) +
+                                  static_cast<size_t>(diagX);
+            if (mask[dstIdx]) {
+                collisions++;
+            }
+            plane[dstIdx] = sample;
+            mask[dstIdx] = 1;
+            packed++;
+        }
+    }
+
+    fillSparsePlane(plane, mask, planeWidth, planeHeight);
+
+    width = planeWidth;
+    height = planeHeight;
+    bitDepth = 16;
+    rgbData.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+    for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+        const uint16_t value = plane[i];
+        rgbData[i * 3 + 0] = value;
+        rgbData[i * 3 + 1] = value;
+        rgbData[i * 3 + 2] = value;
+    }
+
+    logProcessing("readLinearPlaneRgb completed: plane=%d width=%d height=%d packed=%llu collisions=%llu",
+                  planeChannel,
+                  width,
+                  height,
+                  static_cast<unsigned long long>(packed),
+                  static_cast<unsigned long long>(collisions));
+    return true;
+}
+
+// Export FujiCurve as CSV LUT file (compatible with RawTherapee and other editors)
+bool SuperCCDMetadata::exportCurveToCsv(const QString &filePath) const
+{
+    if (!hasCurve) {
+        return false;
+    }
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        return false;
+    }
+    QTextStream out(&file);
+    out << "Index,Value\n";
+    for (int i = 0; i < 65536; ++i) {
+        out << i << "," << curve.data()[i] << "\n";
+    }
+    file.close();
+    return true;
+}
+
+// Export as 3DL LUT file (for DaVinci Resolve, Color Finale, etc.)
+bool SuperCCDMetadata::exportCurveTo3dl(const QString &filePath) const
+{
+    if (!hasCurve) {
+        return false;
+    }
+    std::ofstream file(filePath.toStdString(), std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+    // 3DL format: 65x65x65 cube of RGB triples
+    // Input is linear 0-65535, output is also 0-65535 mapped through curve
+    // We'll create a reduced 17x17x17 cube for smaller file size
+    const int size = 17;
+    for (int b = 0; b < size; ++b) {
+        for (int g = 0; g < size; ++g) {
+            for (int r = 0; r < size; ++r) {
+                // Map grid position to 0-65535 range
+                unsigned short inR = static_cast<unsigned short>((r * 65535) / (size - 1));
+                unsigned short inG = static_cast<unsigned short>((g * 65535) / (size - 1));
+                unsigned short inB = static_cast<unsigned short>((b * 65535) / (size - 1));
+                // Apply curve to each channel
+                unsigned short outR = curve.data()[inR];
+                unsigned short outG = curve.data()[inG];
+                unsigned short outB = curve.data()[inB];
+                // Output as text: R G B (0-255 range for compatibility)
+                file << (outR >> 8) << " " << (outG >> 8) << " " << (outB >> 8) << "\n";
+            }
+        }
+    }
+    file.close();
+    return true;
+}
+
+bool SuperCCDProcessor::readRaw(const QString &inputPath,
+                                bool output12MP,
+                                std::vector<uint16_t> &rawData,
+                                int &width,
+                                int &height,
+                                int &bitDepth,
+                                SuperCCDMetadata &metadata,
+                                QString &error)
+{
+    logProcessing("readRaw open_file: %s", inputPath.toUtf8().constData());
+
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        logProcessing("open_file error %d: %s", result, error.toUtf8().constData());
+        return false;
+    }
+
+    // Fill metadata early to use it for camera-specific dimension logic
+    metadata.make = QString::fromUtf8(raw.imgdata.idata.make);
+    metadata.model = QString::fromUtf8(raw.imgdata.idata.model);
+    metadata.software = QString::fromUtf8(raw.imgdata.idata.software);
+    metadata.dateTime = QString();
+    metadata.iso = raw.imgdata.other.iso_speed;
+    metadata.aperture = raw.imgdata.other.aperture;
+    metadata.shutter = raw.imgdata.other.shutter;
+    // Extract date/time if available
+    if (raw.imgdata.other.timestamp > 0) {
+        char dateBuf[32];
+        struct tm *tm_info = localtime(&raw.imgdata.other.timestamp);
+        strftime(dateBuf, sizeof(dateBuf), "%Y:%m:%d %H:%M:%S", tm_info);
+        metadata.dateTime = QString::fromLatin1(dateBuf);
+    }
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        logProcessing("unpack error %d: %s", result, error.toUtf8().constData());
+        return false;
+    }
+
+    auto &rawdata = raw.imgdata.rawdata;
+    // Trust LibRaw's calculated active dimensions (after margins)
+    int activeW = raw.imgdata.sizes.width;
+    int activeH = raw.imgdata.sizes.height;
+    bitDepth = 16; // LibRaw API changed; assume 16-bit raw samples by default
+
+    logProcessing("sizes: rawW=%d rawH=%d activeW=%d activeH=%d", 
+                  rawdata.sizes.raw_width, rawdata.sizes.raw_height, activeW, activeH);
+    logProcessing("image sizes: iwidth=%d iheight=%d top=%d left=%d fujiWidth=%d isFujiRotated=%d",
+                  raw.imgdata.sizes.iwidth,
+                  raw.imgdata.sizes.iheight,
+                  raw.imgdata.sizes.top_margin,
+                  raw.imgdata.sizes.left_margin,
+                  raw.get_internal_data_pointer()->internal_output_params.fuji_width,
+                  raw.is_fuji_rotated());
+
+    int availW = activeW;
+    int availH = activeH;
+
+    // For Fujifilm SuperCCD SR sensors (S3 Pro, S5 Pro), LibRaw typically provides S and R pixels 
+    // as separate channels in the 4-channel image buffer.
+    if (metadata.model.contains(QLatin1String("S3Pro"), Qt::CaseInsensitive) || 
+        metadata.model.contains(QLatin1String("S5Pro"), Qt::CaseInsensitive)) {
+        if (rawdata.sizes.raw_height < 2000) { 
+            // We will stack S and R pixels vertically in our local rawData vector
+            availH = activeH * 2;
+        }
+    }
+
+    if (availW <= 0 || availH <= 0) {
+        error = QStringLiteral("Invalid RAF raw dimensions or margins.");
+        logProcessing("available area invalid: availW=%d availH=%d", availW, availH);
+        return false;
+    }
+
+    // Use the full available sensor width/height while we inspect the unpacked
+    // SuperCCD sample placement. We later remap this to a Bayer-like plane.
+    width = availW;
+    height = availH;
+    if (width % 2 != 0) width--;
+    if (height % 2 != 0) height--;
+
+    if (width <= 0 || height <= 0) {
+        error = QStringLiteral("Invalid RAF raw dimensions.");
+        return false;
+    }
+
+    rawData.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+
+    // For SuperCCD SR, we need the 4-channel image buffer to get S and R pixels
+    if (raw.imgdata.image == nullptr) {
+        result = raw.raw2image();
+        if (result != LIBRAW_SUCCESS) {
+            error = QString::fromUtf8(libraw_strerror(result));
+            return false;
+        }
+    }
+
+    if (raw.imgdata.image == nullptr) {
+        error = QStringLiteral("Unable to access raw image buffer.");
+        return false;
+    }
+
+    logProcessing("LibRaw image buffer ready; filling rawData vector");
+
+    const int analysisHeight = activeH - (activeH % 2);
+    uint64_t nonZeroByChannel[4] = {0, 0, 0, 0};
+    uint64_t colorByCfa[4] = {0, 0, 0, 0};
+    uint64_t nonZeroSelected = 0;
+    const int fujiWidth = raw.get_internal_data_pointer()->internal_output_params.fuji_width;
+    const int fujiLayout = raw.get_internal_data_pointer()->unpacker_data.fuji_layout;
+    int minX[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+    int minY[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+    int maxX[4] = {-1, -1, -1, -1};
+    int maxY[4] = {-1, -1, -1, -1};
+    int minDenseX = INT_MAX;
+    int minDenseY = INT_MAX;
+    int maxDenseX = -1;
+    int maxDenseY = -1;
+    int minDiagX = INT_MAX;
+    int minDiagY = INT_MAX;
+    int maxDiagX = -1;
+    int maxDiagY = -1;
+    int minHybridX = INT_MAX;
+    int minHybridY = INT_MAX;
+    int maxHybridX = -1;
+    int maxHybridY = -1;
+    uint64_t candidateMismatch[4] = {};
+    uint64_t modCounts[4][4][4] = {};
+    char occupancyMap[9][9] = {};
+    for (int my = 0; my < 8; ++my) {
+        for (int mx = 0; mx < 8; ++mx) {
+            occupancyMap[my][mx] = '.';
+        }
+        occupancyMap[my][8] = '\0';
+    }
+    for (int y = 0; y < analysisHeight; ++y) {
+        for (int x = 0; x < width; ++x) {
+            // Use compact indexing for the de-margined LibRaw image buffer
+            size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            int color = raw.COLOR(y, x);
+            if (color < 0 || color > 3) {
+                color = 0;
+            }
+            if (srcIdx < (size_t)activeW * activeH) {
+                colorByCfa[color]++;
+                for (int c = 0; c < 4; ++c) {
+                    if (raw.imgdata.image[srcIdx][c] != 0) {
+                        nonZeroByChannel[c]++;
+                        if (x < minX[c]) minX[c] = x;
+                        if (y < minY[c]) minY[c] = y;
+                        if (x > maxX[c]) maxX[c] = x;
+                        if (y > maxY[c]) maxY[c] = y;
+                        int denseY = 0;
+                        int denseX = 0;
+                        if (fujiLayout) {
+                            denseY = fujiWidth - 1 - x + (y >> 1);
+                            denseX = x + ((y + 1) >> 1);
+                        } else {
+                            denseY = fujiWidth - 1 + y - (x >> 1);
+                            denseX = y + ((x + 1) >> 1);
+                        }
+                        if (denseX < minDenseX) minDenseX = denseX;
+                        if (denseY < minDenseY) minDenseY = denseY;
+                        if (denseX > maxDenseX) maxDenseX = denseX;
+                        if (denseY > maxDenseY) maxDenseY = denseY;
+                        int diagX = (x + y) >> 1;
+                        int diagY = ((y - x) >> 1) + fujiWidth;
+                        if (diagX < minDiagX) minDiagX = diagX;
+                        if (diagY < minDiagY) minDiagY = diagY;
+                        if (diagX > maxDiagX) maxDiagX = diagX;
+                        if (diagY > maxDiagY) maxDiagY = diagY;
+                        int hybridX = denseX;
+                        int hybridY = diagY;
+                        if (hybridX < minHybridX) minHybridX = hybridX;
+                        if (hybridY < minHybridY) minHybridY = hybridY;
+                        if (hybridX > maxHybridX) maxHybridX = hybridX;
+                        if (hybridY > maxHybridY) maxHybridY = hybridY;
+                        const int outputColor = (c == 3) ? 1 : c;
+                        const int parityOptions[4] = {x & 1, y & 1, (x + y) & 1, c & 1};
+                        for (int p = 0; p < 4; ++p) {
+                            int outYParity = diagY & 1;
+                            int outXParity = parityOptions[p];
+                            int cfaColor = (outYParity == 0)
+                                               ? (outXParity == 0 ? 0 : 1)
+                                               : (outXParity == 0 ? 1 : 2);
+                            if (cfaColor != outputColor) {
+                                candidateMismatch[p]++;
+                            }
+                        }
+                        modCounts[c][y & 3][x & 3]++;
+                        if (y < 8 && x < 8) {
+                            occupancyMap[y][x] = static_cast<char>('0' + c);
+                        }
+                    }
+                }
+                if (raw.imgdata.image[srcIdx][color] != 0) {
+                    nonZeroSelected++;
+                }
+            }
+
+        }
+    }
+
+    logProcessing("LibRaw color stats: cdesc=%s filters=0x%x colors=%d",
+                  raw.imgdata.idata.cdesc,
+                  raw.imgdata.idata.filters,
+                  raw.imgdata.idata.colors);
+    logProcessing("CFA color counts: c0=%llu c1=%llu c2=%llu c3=%llu selectedNonZero=%llu",
+                  static_cast<unsigned long long>(colorByCfa[0]),
+                  static_cast<unsigned long long>(colorByCfa[1]),
+                  static_cast<unsigned long long>(colorByCfa[2]),
+                  static_cast<unsigned long long>(colorByCfa[3]),
+                  static_cast<unsigned long long>(nonZeroSelected));
+    logProcessing("Image channel nonzero counts: ch0=%llu ch1=%llu ch2=%llu ch3=%llu",
+                  static_cast<unsigned long long>(nonZeroByChannel[0]),
+                  static_cast<unsigned long long>(nonZeroByChannel[1]),
+                  static_cast<unsigned long long>(nonZeroByChannel[2]),
+                  static_cast<unsigned long long>(nonZeroByChannel[3]));
+    logProcessing("Fuji dense bbox: layout=%d x=%d..%d y=%d..%d size=%dx%d",
+                  fujiLayout,
+                  minDenseX,
+                  maxDenseX,
+                  minDenseY,
+                  maxDenseY,
+                  maxDenseX >= minDenseX ? (maxDenseX - minDenseX + 1) : 0,
+                  maxDenseY >= minDenseY ? (maxDenseY - minDenseY + 1) : 0);
+    logProcessing("Fuji diagonal bbox: x=%d..%d y=%d..%d size=%dx%d",
+                  minDiagX,
+                  maxDiagX,
+                  minDiagY,
+                  maxDiagY,
+                  maxDiagX >= minDiagX ? (maxDiagX - minDiagX + 1) : 0,
+                  maxDiagY >= minDiagY ? (maxDiagY - minDiagY + 1) : 0);
+    logProcessing("Fuji hybrid bbox: x=%d..%d y=%d..%d size=%dx%d",
+                  minHybridX,
+                  maxHybridX,
+                  minHybridY,
+                  maxHybridY,
+                  maxHybridX >= minHybridX ? (maxHybridX - minHybridX + 1) : 0,
+                  maxHybridY >= minHybridY ? (maxHybridY - minHybridY + 1) : 0);
+    logProcessing("Fuji pack CFA mismatches: xParity=%llu yParity=%llu xyParity=%llu channelParity=%llu",
+                  static_cast<unsigned long long>(candidateMismatch[0]),
+                  static_cast<unsigned long long>(candidateMismatch[1]),
+                  static_cast<unsigned long long>(candidateMismatch[2]),
+                  static_cast<unsigned long long>(candidateMismatch[3]));
+    logProcessing("Nonzero channel 8x8 map: %s/%s/%s/%s/%s/%s/%s/%s",
+                  occupancyMap[0], occupancyMap[1], occupancyMap[2], occupancyMap[3],
+                  occupancyMap[4], occupancyMap[5], occupancyMap[6], occupancyMap[7]);
+    for (int c = 0; c < 4; ++c) {
+        logProcessing("Channel %d bbox: x=%d..%d y=%d..%d", c, minX[c], maxX[c], minY[c], maxY[c]);
+        logProcessing("Channel %d mod4 rows: [%llu,%llu,%llu,%llu] [%llu,%llu,%llu,%llu] [%llu,%llu,%llu,%llu] [%llu,%llu,%llu,%llu]",
+                      c,
+                      static_cast<unsigned long long>(modCounts[c][0][0]), static_cast<unsigned long long>(modCounts[c][0][1]),
+                      static_cast<unsigned long long>(modCounts[c][0][2]), static_cast<unsigned long long>(modCounts[c][0][3]),
+                      static_cast<unsigned long long>(modCounts[c][1][0]), static_cast<unsigned long long>(modCounts[c][1][1]),
+                      static_cast<unsigned long long>(modCounts[c][1][2]), static_cast<unsigned long long>(modCounts[c][1][3]),
+                      static_cast<unsigned long long>(modCounts[c][2][0]), static_cast<unsigned long long>(modCounts[c][2][1]),
+                      static_cast<unsigned long long>(modCounts[c][2][2]), static_cast<unsigned long long>(modCounts[c][2][3]),
+                      static_cast<unsigned long long>(modCounts[c][3][0]), static_cast<unsigned long long>(modCounts[c][3][1]),
+                      static_cast<unsigned long long>(modCounts[c][3][2]), static_cast<unsigned long long>(modCounts[c][3][3]));
+    }
+
+    if (output12MP && fujiWidth > 0 && minDiagX <= maxDiagX && minDiagY <= maxDiagY) {
+        const int diagWidth = maxDiagX - minDiagX + 1;
+        const int diagHeight = maxDiagY - minDiagY + 1;
+        const int planeWidth = ((diagWidth + 1) / 2) * 2;
+        std::vector<uint16_t> planeG1(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint16_t> planeR(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint16_t> planeB(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint16_t> planeG2(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint8_t> maskG1(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint8_t> maskR(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint8_t> maskB(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        std::vector<uint8_t> maskG2(static_cast<size_t>(planeWidth) * static_cast<size_t>(diagHeight));
+        uint64_t packed = 0;
+        uint64_t collisions = 0;
+
+        for (int y = 0; y < analysisHeight; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                if (srcIdx >= static_cast<size_t>(activeW) * static_cast<size_t>(activeH)) {
+                    continue;
+                }
+
+                const int diagX = ((x + y) >> 1) - minDiagX;
+                const int diagY = (((y - x) >> 1) + fujiWidth) - minDiagY;
+                if (diagX < 0 || diagX >= diagWidth || diagY < 0 || diagY >= diagHeight) {
+                    continue;
+                }
+
+                for (int c = 0; c < 4; ++c) {
+                    const uint16_t sample = raw.imgdata.image[srcIdx][c];
+                    if (sample == 0) {
+                        continue;
+                    }
+
+                    std::vector<uint16_t> *plane = nullptr;
+                    std::vector<uint8_t> *mask = nullptr;
+                    switch (c) {
+                    case 3:
+                        plane = &planeG1;
+                        mask = &maskG1;
+                        break;
+                    case 0:
+                        plane = &planeR;
+                        mask = &maskR;
+                        break;
+                    case 2:
+                        plane = &planeB;
+                        mask = &maskB;
+                        break;
+                    case 1:
+                        plane = &planeG2;
+                        mask = &maskG2;
+                        break;
+                    default:
+                        continue;
+                    }
+
+                    const size_t dstIdx = static_cast<size_t>(diagY) * static_cast<size_t>(planeWidth) +
+                                          static_cast<size_t>(diagX);
+                    if ((*mask)[dstIdx]) {
+                        collisions++;
+                    }
+                    (*plane)[dstIdx] = sample;
+                    (*mask)[dstIdx] = 1;
+                    packed++;
+                }
+            }
+        }
+
+        fillSparsePlane(planeG1, maskG1, planeWidth, diagHeight);
+        fillSparsePlane(planeR, maskR, planeWidth, diagHeight);
+        fillSparsePlane(planeB, maskB, planeWidth, diagHeight);
+        fillSparsePlane(planeG2, maskG2, planeWidth, diagHeight);
+
+        const int outWidth = planeWidth * 2;
+        const int outHeight = diagHeight * 2;
+        std::vector<uint16_t> denseData(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight));
+        for (int py = 0; py < diagHeight; ++py) {
+            for (int px = 0; px < planeWidth; ++px) {
+                const size_t planeIdx = static_cast<size_t>(py) * static_cast<size_t>(planeWidth) +
+                                        static_cast<size_t>(px);
+                denseData[static_cast<size_t>(py * 2) * static_cast<size_t>(outWidth) +
+                          static_cast<size_t>(px * 2)] = planeG1[planeIdx];
+                denseData[static_cast<size_t>(py * 2) * static_cast<size_t>(outWidth) +
+                          static_cast<size_t>(px * 2 + 1)] = planeR[planeIdx];
+                denseData[static_cast<size_t>(py * 2 + 1) * static_cast<size_t>(outWidth) +
+                          static_cast<size_t>(px * 2)] = planeB[planeIdx];
+                denseData[static_cast<size_t>(py * 2 + 1) * static_cast<size_t>(outWidth) +
+                          static_cast<size_t>(px * 2 + 1)] = planeG2[planeIdx];
+            }
+        }
+
+        width = outWidth;
+        height = outHeight;
+        rawData.swap(denseData);
+        logProcessing("Direct SuperCCD remap to Bayer-like CFA: planeWidth=%d planeHeight=%d outWidth=%d outHeight=%d packed=%llu collisions=%llu",
+                      planeWidth,
+                      diagHeight,
+                      width,
+                      height,
+                      static_cast<unsigned long long>(packed),
+                      static_cast<unsigned long long>(collisions));
+    } else if (fujiWidth > 0 && minDiagX <= maxDiagX && minDiagY <= maxDiagY) {
+        const int diagWidth = maxDiagX - minDiagX + 1;
+        const int diagHeight = maxDiagY - minDiagY + 1;
+        const int denseWidth = ((diagWidth + 1) / 2) * 2;
+        const int denseHeight = diagHeight * 2;
+        std::vector<uint16_t> denseData(static_cast<size_t>(denseWidth) * static_cast<size_t>(denseHeight));
+        uint64_t packed = 0;
+        uint64_t collisions = 0;
+        uint64_t parityViolations = 0;
+
+        for (int y = 0; y < analysisHeight; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t srcIdx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                if (srcIdx >= static_cast<size_t>(activeW) * static_cast<size_t>(activeH)) {
+                    continue;
+                }
+
+                const int diagX = ((x + y) >> 1) - minDiagX;
+                const int diagY = (((y - x) >> 1) + fujiWidth) - minDiagY;
+                if (diagX < 0 || diagX >= diagWidth || diagY < 0 || diagY >= diagHeight) {
+                    continue;
+                }
+
+                const int rowParity = diagY & 1;
+
+                for (int c = 0; c < 4; ++c) {
+                    const uint16_t sample = raw.imgdata.image[srcIdx][c];
+                    if (sample == 0) {
+                        continue;
+                    }
+
+                    int blockX = 0;
+                    int rowOffset = 0;
+                    int xOffset = 0;
+                    switch (c) {
+                    case 3: // G for the first row of a GRBG block
+                        if ((diagX & 1) == rowParity) {
+                            parityViolations++;
+                        }
+                        blockX = (diagX - (1 - rowParity)) / 2;
+                        rowOffset = 0;
+                        xOffset = 0;
+                        break;
+                    case 0: // R
+                        if ((diagX & 1) == rowParity) {
+                            parityViolations++;
+                        }
+                        blockX = (diagX - (1 - rowParity)) / 2;
+                        rowOffset = 0;
+                        xOffset = 1;
+                        break;
+                    case 2: // B
+                        if ((diagX & 1) != rowParity) {
+                            parityViolations++;
+                        }
+                        blockX = (diagX - rowParity) / 2;
+                        rowOffset = 1;
+                        xOffset = 0;
+                        break;
+                    case 1: // G for the second row of a GRBG block
+                        if ((diagX & 1) != rowParity) {
+                            parityViolations++;
+                        }
+                        blockX = (diagX - rowParity) / 2;
+                        rowOffset = 1;
+                        xOffset = 1;
+                        break;
+                    default:
+                        continue;
+                    }
+
+                    if (blockX < 0 || blockX >= (denseWidth / 2)) {
+                        continue;
+                    }
+
+                    const int outX = blockX * 2 + xOffset;
+                    const int outY = diagY * 2 + rowOffset;
+                    const size_t dstIdx = static_cast<size_t>(outY) * static_cast<size_t>(denseWidth) +
+                                          static_cast<size_t>(outX);
+                    if (denseData[dstIdx] != 0) {
+                        collisions++;
+                    }
+                    denseData[dstIdx] = sample;
+                    packed++;
+                }
+            }
+        }
+
+        width = denseWidth;
+        height = denseHeight;
+        rawData.swap(denseData);
+        logProcessing("Packed Fuji sparse image to Bayer-like CFA: width=%d height=%d packed=%llu collisions=%llu parityViolations=%llu",
+                      width,
+                      height,
+                      static_cast<unsigned long long>(packed),
+                      static_cast<unsigned long long>(collisions),
+                      static_cast<unsigned long long>(parityViolations));
+    }
+
+    logProcessing("readRaw completed: width=%d height=%d bitDepth=%d", width, height, bitDepth);
+
+    return true;
+}
+
+bool SuperCCDProcessor::reconstructSuperCCD(const std::vector<uint16_t> &rawData,
+                                            int width,
+                                            int height,
+                                            bool output12MP,
+                                            std::vector<uint16_t> &outputData,
+                                            int &outWidth,
+                                            int &outHeight,
+                                            QString &error)
+{
+    if (width <= 0 || height <= 0) {
+        error = QStringLiteral("Invalid raw image size.");
+        return false;
+    }
+
+    // The 12 MP path is now produced directly in readRaw(). The 6 MP path
+    // still returns the packed half-width Bayer-like CFA plane.
+    outWidth = output12MP ? width : width;
+    outHeight = height;
+
+    if (outWidth == 0 || outHeight == 0) {
+        error = QStringLiteral("Image dimensions too small.");
+        return false;
+    }
+
+    outputData.resize(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight));
+
+    if (!output12MP) {
+        for (size_t i = 0; i < outputData.size() && i < rawData.size(); ++i) {
+            outputData[i] = rawData[i];
+        }
+        return true;
+    }
+
+    for (size_t i = 0; i < outputData.size() && i < rawData.size(); ++i) {
+        outputData[i] = rawData[i];
+    }
+
+    return true;
+}

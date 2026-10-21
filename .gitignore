@@ -1,0 +1,9 @@
+build-win/
+build-termux/
+build/
+.gradle/
+*.log
+android-s5pro/third_party/libtiff/doc/
+android-s5pro/third_party/libtiff/man/
+android-s5pro/third_party/libtiff/contrib/
+android-s5pro/third_party/libtiff/test/

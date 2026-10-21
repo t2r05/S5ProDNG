@@ -1,0 +1,33 @@
+﻿apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.s5pro.converter'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.s5pro.converter"
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DS5CONV_ANDROID=ON',
+                          '-DANDROID_STL=c++_shared'
+                cppFlags '-std=c++17 -O2'
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path '../../CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}
+dependencies {}
