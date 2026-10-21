@@ -99,6 +99,17 @@ public:
                  const ConversionSettings &settings,
                  QString &error);
 
+    // Renders the RAF through LibRaw's full display pipeline: camera white
+    // balance, sRGB gamma/color, the camera-embedded tone curve honored
+    // (no auto-bright override), fuji_rotate geometry. Saves a JPEG scaled
+    // to <=maxSize (maxSize<=0 keeps native size). This is the basis of the
+    // "Fuji color" mode: the embedded per-shot curve is the piece Lightroom
+    // never sees when developing our CFA DNG.
+    bool renderLibRawJpeg(const QString &inputPath,
+                          const QString &outJpegPath,
+                          int maxSize,
+                          QString &error);
+
     bool renderPreview(const QString &inputPath,
                        const ConversionSettings &settings,
                        QImage &preview,

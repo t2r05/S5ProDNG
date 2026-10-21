@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
 
     ConversionSettings settings;
     bool exportPlanes = false;
+    std::string fujiJpegPath;
+    int fujiMax = 1600;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&](const char *prefix) -> const char * {
@@ -64,6 +66,8 @@ int main(int argc, char **argv) {
         else if (const char *v = val("--delay=")) settings.rTransitionDelay = std::clamp(std::atof(v), 0.01, 1.0);
         else if (const char *v = val("--smoothness=")) settings.rTransitionSmoothness = std::clamp(std::atof(v), 0.0, 1.0);
         else if (const char *v = val("--r-luma-nr=")) settings.rLumaNoiseReduction = std::clamp(std::atof(v), 0.0, 1.0);
+        else if (const char *v = val("--fuji-jpeg=")) fujiJpegPath = v;
+        else if (const char *v = val("--fuji-max=")) fujiMax = std::atoi(v);
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); printUsage(); return 64; }
     }
     settings.exportPlaneImages = exportPlanes;
@@ -79,5 +83,14 @@ int main(int argc, char **argv) {
         return 2;
     }
     fprintf(stderr, "Conversion OK\n");
+    if (!fujiJpegPath.empty()) {
+        QString fujiErr;
+        if (processor.renderLibRawJpeg(in, QString::fromLocal8Bit(fujiJpegPath.c_str()), fujiMax, fujiErr)) {
+            fprintf(stderr, "Fuji color JPEG: %s\n", fujiJpegPath.c_str());
+        } else {
+            fprintf(stderr, "Fuji color JPEG FAILED: %s\n", fujiErr.toStdString().c_str());
+            return 3;
+        }
+    }
     return 0;
 }

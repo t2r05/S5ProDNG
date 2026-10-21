@@ -5625,3 +5625,91 @@ bool SuperCCDProcessor::reconstructSuperCCD(const std::vector<uint16_t> &rawData
 
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Fuji color mode: full LibRaw display render honoring the camera-embedded
+// tone curve (the piece a CFA DNG loses in Lightroom's own development).
+bool SuperCCDProcessor::renderLibRawJpeg(const QString &inputPath,
+                                         const QString &outJpegPath,
+                                         int maxSize,
+                                         QString &error)
+{
+    LibRaw raw;
+    int result = raw.open_file(inputPath.toUtf8().constData());
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+
+    // Display-oriented params:
+    //  - camera white balance (per-shot data from the RAF)
+    //  - sRGB gamma + sRGB output color
+    //  - keep the embedded camera curve's exposure intent (no_auto_bright),
+    //    which is what the official Fuji converter builds its look from
+    raw.imgdata.params.use_camera_wb = 1;
+    raw.imgdata.params.output_bps = 8;
+    raw.imgdata.params.output_color = 1;
+    raw.imgdata.params.gamm[0] = 1.0f / 2.4f;
+    raw.imgdata.params.gamm[1] = 4.5f;
+    raw.imgdata.params.no_auto_bright = 1;
+    raw.imgdata.params.bright = 1.0f;
+
+    result = raw.unpack();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+    result = raw.dcraw_process();
+    if (result != LIBRAW_SUCCESS) {
+        error = QString::fromUtf8(libraw_strerror(result));
+        return false;
+    }
+    int imageError = LIBRAW_SUCCESS;
+    libraw_processed_image_t *image = raw.dcraw_make_mem_image(&imageError);
+    if (!image) {
+        error = QString::fromUtf8(libraw_strerror(imageError));
+        return false;
+    }
+    if (image->type != LIBRAW_IMAGE_BITMAP || image->colors < 3) {
+        LibRaw::dcraw_clear_mem(image);
+        error = QStringLiteral("LibRaw did not return an RGB image.");
+        return false;
+    }
+
+    const int w = static_cast<int>(image->width);
+    const int h = static_cast<int>(image->height);
+    QImage img(w, h, QImage::Format_RGB888);
+    if (image->bits == 8) {
+        const uint8_t *src = image->data;
+        for (int y = 0; y < h; ++y) {
+            uchar *line = img.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (static_cast<size_t>(y) * w + x) * image->colors;
+                line[x * 3 + 0] = src[i + 0];
+                line[x * 3 + 1] = src[i + 1];
+                line[x * 3 + 2] = src[i + 2];
+            }
+        }
+    } else {
+        const uint16_t *src = reinterpret_cast<const uint16_t *>(image->data);
+        for (int y = 0; y < h; ++y) {
+            uchar *line = img.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (static_cast<size_t>(y) * w + x) * image->colors;
+                line[x * 3 + 0] = static_cast<uchar>(src[i + 0] >> 8);
+                line[x * 3 + 1] = static_cast<uchar>(src[i + 1] >> 8);
+                line[x * 3 + 2] = static_cast<uchar>(src[i + 2] >> 8);
+            }
+        }
+    }
+    LibRaw::dcraw_clear_mem(image);
+
+    if (maxSize > 0 && (w > maxSize || h > maxSize)) {
+        img = img.scaled(maxSize, maxSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    if (!img.save(outJpegPath, "jpg", 94)) {
+        error = QStringLiteral("JPEG encode failed.");
+        return false;
+    }
+    return true;
+}

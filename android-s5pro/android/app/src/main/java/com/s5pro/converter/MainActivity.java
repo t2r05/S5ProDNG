@@ -49,6 +49,7 @@ public class MainActivity extends Activity {
                                        double start, double delay, double smoothness);
     public native boolean nativeExtractThumbnail(String inPath, String outJpegPath);
     public native String nativeReadMetadata(String inPath);
+    public native boolean nativeRenderFujiJpeg(String inPath, String outJpegPath, int maxSize);
 
     static final int ST_PENDING = 0, ST_THUMB_OK = 1, ST_WORKING = 2, ST_DONE = 3, ST_ERROR = 4;
 
@@ -92,6 +93,7 @@ public class MainActivity extends Activity {
     LinearLayout advPanel;
     SeekBar sbStart, sbDelay, sbSmooth;
     TextView advVals;
+    android.widget.CheckBox fujiCheck;
     volatile boolean converting;
     final Handler main = new Handler(Looper.getMainLooper());
 
@@ -109,6 +111,8 @@ public class MainActivity extends Activity {
         sbDelay = findViewById(R.id.sbDelay);
         sbSmooth = findViewById(R.id.sbSmooth);
         advVals = findViewById(R.id.advVals);
+        fujiCheck = findViewById(R.id.fujiCheck);
+        fujiCheck.setChecked(true);
         updateAdvLabel();
 
         SeekBar.OnSeekBarChangeListener advL = new SeekBar.OnSeekBarChangeListener() {
@@ -346,7 +350,20 @@ public class MainActivity extends Activity {
             if (err != null) { cleanup(raf); return err; }
             Uri savedDng = saveToDownloads(base + "_merged.dng", dng, "image/x-adobe-dng");
             boolean share = false;
-            if (it.thumbJpeg != null) {
+            File fujiJpg = new File(getCacheDir(), base + "_fuji.jpg");
+            if (fujiCheck.isChecked()) {
+                // Fuji color mode: full LibRaw display render honoring the
+                // camera-embedded tone curve, then watermark.
+                if (nativeRenderFujiJpeg(raf.getAbsolutePath(), fujiJpg.getAbsolutePath(), 1600)) {
+                    File out = new File(getCacheDir(), base + "_wm.jpg");
+                    if (watermarkJpeg(fujiJpg, out)) {
+                        Uri u = saveToDownloads(base + "_fuji.jpg", out, "image/jpeg");
+                        share = (u != null);
+                    }
+                    cleanup(out);
+                }
+                cleanup(fujiJpg);
+            } else if (it.thumbJpeg != null) {
                 share = makeShareJpeg(it, base);
             }
             cleanup(raf); cleanup(dng);
@@ -361,16 +378,32 @@ public class MainActivity extends Activity {
     /** Downscaled (<=1600px) watermarked JPEG of the embedded preview. */
     boolean makeShareJpeg(RafItem it, String base) {
         try {
+            if (it.thumbJpeg == null) return false;
+            File src = new File(it.thumbJpeg);
+            File out = new File(getCacheDir(), base + "_wm.jpg");
+            boolean ok = watermarkJpeg(src, out);
+            if (!ok) return false;
+            Uri u = saveToDownloads(base + "_share.jpg", out, "image/jpeg");
+            cleanup(out);
+            return u != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Decodes src (<=1600px), draws the watermark, writes JPEG. */
+    boolean watermarkJpeg(File src, File out) {
+        try {
             BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inSampleSize = sampleFor(it.thumbJpeg, 1600);
-            Bitmap b = BitmapFactory.decodeFile(it.thumbJpeg, o);
+            o.inSampleSize = sampleFor(src.getAbsolutePath(), 1600);
+            Bitmap b = BitmapFactory.decodeFile(src.getAbsolutePath(), o);
             if (b == null) return false;
             Bitmap work = b;
             if (b.getWidth() > 1600) {
                 work = Bitmap.createScaledBitmap(b, 1600, 1600 * b.getHeight() / b.getWidth(), true);
             }
-            Bitmap out = work.copy(Bitmap.Config.ARGB_8888, true);
-            if (out != work) work = out;
+            Bitmap outB = work.copy(Bitmap.Config.ARGB_8888, true);
+            if (outB != work) work = outB;
             Canvas c = new Canvas(work);
             Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
             p.setColor(Color.WHITE);
@@ -381,13 +414,10 @@ public class MainActivity extends Activity {
             float tw = p.measureText(txt);
             c.drawText(txt, work.getWidth() - tw - work.getWidth() * 0.03f,
                     work.getHeight() - work.getWidth() * 0.03f, p);
-            File jpg = new File(getCacheDir(), base + "_share.jpg");
-            try (FileOutputStream fos = new FileOutputStream(jpg)) {
+            try (FileOutputStream fos = new FileOutputStream(out)) {
                 work.compress(Bitmap.CompressFormat.JPEG, 90, fos);
             }
-            Uri u = saveToDownloads(base + "_share.jpg", jpg, "image/jpeg");
-            cleanup(jpg);
-            return u != null;
+            return true;
         } catch (Exception e) {
             return false;
         }

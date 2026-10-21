@@ -4,14 +4,19 @@
 **无 Qt 依赖** 的 headless 核心，并套上安卓 App。**批量**选 RAF → 本地完成 S/R 合并 →
 输出 Adobe DNG + 水印分享 JPEG，全程离线。
 
-## App 功能（v1.1，对标 Contenta Converter 逆向调研的移动端落地）
+## App 功能（v1.2，对标 Contenta Converter + 富士 EX 3.0 逆向调研的移动端落地）
 - **批量队列**：系统文件器多选 RAF，逐项状态跟踪（排队/缩略图/转换中/完成/失败）
 - **缩略图墙**：直接从 RAF 内嵌预览秒出小图（无需先解码 RAW）
 - **EXIF 面板**：长按条目查看机型/镜头/ISO/光圈/快门/白平衡/动态范围参数
 - **DNG 输出**：S/R 合并后 6MP CFA DNG，存 `Download/s5dng/<名>_merged.dng`（Lightroom/Snapseed 可直接编辑）
-- **水印分享 JPEG**：每张同时输出 ≤1600px 带水印 JPEG（`<名>_share.jpg`），发圈免二次处理
+- **★ 富士色彩 JPEG（v1.2 新增）**：走 LibRaw 全渲染管线——**相机内嵌色调曲线 + 相机白平衡 + sRGB**，即官方转换器色彩科学中 Lightroom 解 CFA DNG 时看不到的那块数据（LibRaw `mem_image.cpp` 逐像素应用 `color.curve`，已源码验证）；带水印输出 `<名>_fuji.jpg`
+- **水印分享 JPEG**：未开启富士色彩时回退到内嵌预览水印版（`<名>_share.jpg`）
 - **S→R 合并曲线调节**：起点/宽度/平滑度三滑杆（对应 CLI `--start/--delay/--smoothness`）
 - 全程离线 · 无任何第三方依赖 · API 29+（Android 10/11/12/13/14+）
+
+### 富士色彩模式的技术依据（逆向调研结论，详见 富士RAW转换器研究.md）
+- 小红书实拍派用 **RAW FILE CONVERTER EX 3.0 powered by SILKYPIX**（富士官网免费、2026-03 仍更新、明确支持 S5 Pro）直出零后期肤色；社区共识「只有 Silkypix 和 Capture One 拿到了富士色彩科技授权」
+- 差异主因：① RAF 是双帧文件，通用引擎只读 S 帧（本 App 的 DNG 路径是**完整 S/R 合并**，反而更全）；② 相机内嵌色调曲线只有官方管线会应用（本模式的 JPEG 路径通过 LibRaw 应用同一曲线）；③ SILKYPIX 新引擎去马赛克代差（无法复刻，诚实承认）
 
 ## 本机验证结论（2026-10-21，Windows x64，MSYS2 GCC 16.2）
 
