@@ -4,19 +4,21 @@
 **无 Qt 依赖** 的 headless 核心，并套上安卓 App。**批量**选 RAF → 本地完成 S/R 合并 →
 输出 Adobe DNG + 水印分享 JPEG，全程离线。
 
-## App 功能（v1.3，对标 Contenta Converter + 富士 EX 3.0 逆向调研的移动端落地）
-- **批量队列**：系统文件器多选 RAF，逐项状态跟踪（排队/缩略图/转换中/完成/失败）
-- **缩略图墙**：直接从 RAF 内嵌预览秒出小图（无需先解码 RAW）
+## App 功能（v1.4）
+- **批量队列**：多选 RAF，逐项状态跟踪；**点击条目 = 前后对比**（内嵌预览 vs 富士渲染，滑动分割线）
+- **缩略图墙**：直接从 RAF 内嵌预览秒出小图
 - **EXIF 面板**：长按条目查看机型/镜头/ISO/光圈/快门/白平衡/动态范围参数
-- **DNG 输出**：S/R 合并后 6MP CFA DNG，存 `Download/s5dng/<名>_merged.dng`（Lightroom/Snapseed 可直接编辑）
-- **★ 富士色彩 JPEG**：LibRaw 显示级全渲染——相机白平衡 + dcraw S5 Pro 色彩矩阵 + sRGB + 完整 fuji_rotate 几何，不经过 Lightroom 二次解读；带水印输出 `<名>_fuji.jpg`
-- **★ v1.3 新增（对标 Contenta 功能矩阵）**：
-  - **尺寸预设**：长边 1600 / 1080 / 方图 1080×1080 / 全尺寸
-  - **快速效果**：黑白 / 棕褐 / 亮度+ / 对比+（ColorMatrix 实时套用）
-  - **PDF 接触表**：转换完成后一键导出 A4 六宫格接触表（对标 Contenta PDF Albums）
-  - **拍摄时间重命名**：输出 `S5_yyyyMMddHHmmss`（对标 Contenta 批量重命名）
-- **S→R 合并曲线调节**：起点/宽度/平滑度三滑杆（对应 CLI `--start/--delay/--smoothness`）
-- 全程离线 · 无任何第三方依赖 · API 29+（Android 10/11/12/13/14+）
+- **DNG 输出（可关）**：S/R 合并后 6MP CFA DNG → `Download/s5dng/<名>_merged.dng`
+- **★ 富士色彩 JPEG**：LibRaw 显示级全渲染（相机白平衡 + dcraw S5 Pro 色彩矩阵 + sRGB + fuji_rotate），带水印 `<名>_fuji.jpg`
+- **★ 解码管线开关（v1.4 新增）**：富士 JPEG 的去马赛克算法七选——默认 AHD / PPG / VNG / 线性（最快）/ DCB / DHT / AAHD
+- **★ 半尺寸快渲（v1.4 新增）**：half_size 渲染，速度大幅提升，选图用
+- **★ DNG 输出开关（v1.4 新增）**：只要快速 JPEG 批量时关掉它
+- **尺寸预设**：长边 1600 / 1080 / 方图 1080×1080 / 全尺寸
+- **快速效果**：黑白 / 棕褐 / 亮度+ / 对比+
+- **PDF 接触表**：A4 六宫格一键导出
+- **拍摄时间重命名**：`S5_yyyyMMddHHmmss`
+- **S→R 合并曲线**：起点/宽度/平滑度三滑杆
+- 全程离线 · 零第三方依赖 · Android 10+
 
 ### 富士色彩模式的技术依据（逆向调研结论，详见 富士RAW转换器研究.md / 肤色科学技术分析.md）
 - 小红书实拍派用 **RAW FILE CONVERTER EX 3.0 powered by SILKYPIX**（富士官网免费、2026-03 仍更新、明确支持 S5 Pro）直出零后期肤色；社区共识「只有 Silkypix 和 Capture One 拿到了富士色彩科技授权」

@@ -5632,6 +5632,8 @@ bool SuperCCDProcessor::reconstructSuperCCD(const std::vector<uint16_t> &rawData
 bool SuperCCDProcessor::renderLibRawJpeg(const QString &inputPath,
                                          const QString &outJpegPath,
                                          int maxSize,
+                                         int demosaic,
+                                         bool halfSize,
                                          QString &error)
 {
     LibRaw raw;
@@ -5644,8 +5646,7 @@ bool SuperCCDProcessor::renderLibRawJpeg(const QString &inputPath,
     // Display-oriented params:
     //  - camera white balance (per-shot data from the RAF)
     //  - sRGB gamma + sRGB output color
-    //  - keep the embedded camera curve's exposure intent (no_auto_bright),
-    //    which is what the official Fuji converter builds its look from
+    //  - user-selectable demosaic pipeline, optional half-size fast render
     raw.imgdata.params.use_camera_wb = 1;
     raw.imgdata.params.output_bps = 8;
     raw.imgdata.params.output_color = 1;
@@ -5653,6 +5654,12 @@ bool SuperCCDProcessor::renderLibRawJpeg(const QString &inputPath,
     raw.imgdata.params.gamm[1] = 4.5f;
     raw.imgdata.params.no_auto_bright = 1;
     raw.imgdata.params.bright = 1.0f;
+    if (demosaic >= 0) {
+        raw.imgdata.params.user_qual = static_cast<unsigned>(demosaic);
+    }
+    if (halfSize) {
+        raw.imgdata.params.half_size = 1;
+    }
 
     result = raw.unpack();
     if (result != LIBRAW_SUCCESS) {

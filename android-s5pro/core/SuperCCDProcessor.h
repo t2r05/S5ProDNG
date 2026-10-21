@@ -100,14 +100,16 @@ public:
                  QString &error);
 
     // Renders the RAF through LibRaw's full display pipeline: camera white
-    // balance, sRGB gamma/color, the camera-embedded tone curve honored
-    // (no auto-bright override), fuji_rotate geometry. Saves a JPEG scaled
-    // to <=maxSize (maxSize<=0 keeps native size). This is the basis of the
-    // "Fuji color" mode: the embedded per-shot curve is the piece Lightroom
-    // never sees when developing our CFA DNG.
+    // balance, sRGB gamma/color, dcraw S5 Pro color matrix, fuji_rotate
+    // geometry. Saves a JPEG scaled down to maxSize (maxSize<=0 = native).
+    // demosaic: LibRaw user_qual (-1 default, 0 linear, 1 VNG, 2 PPG,
+    // 3 AHD, 4 DCB, 11 DHT, 12 AAHD). halfSize: render at half resolution
+    // (much faster, quarter pixels).
     bool renderLibRawJpeg(const QString &inputPath,
                           const QString &outJpegPath,
                           int maxSize,
+                          int demosaic,
+                          bool halfSize,
                           QString &error);
 
     bool renderPreview(const QString &inputPath,

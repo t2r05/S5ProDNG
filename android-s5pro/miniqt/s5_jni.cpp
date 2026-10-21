@@ -129,19 +129,21 @@ Java_com_s5pro_converter_MainActivity_nativeReadMetadata(JNIEnv *env, jobject /*
     return env->NewStringUTF(j.c_str());
 }
 
-// Fuji color mode: full LibRaw display render (camera WB + embedded curve)
-// saved as JPEG scaled to <=maxSize. Returns true on success.
+// Fuji color mode: full LibRaw display render (camera WB + S5 Pro matrix,
+// selectable demosaic pipeline) saved as JPEG scaled to <=maxSize.
 JNIEXPORT jboolean JNICALL
 Java_com_s5pro_converter_MainActivity_nativeRenderFujiJpeg(JNIEnv *env, jobject /*thiz*/,
                                                            jstring jIn, jstring jOutJpeg,
-                                                           jint maxSize) {
+                                                           jint maxSize, jint demosaic,
+                                                           jboolean halfSize) {
     const char *in = env->GetStringUTFChars(jIn, nullptr);
     const char *out = env->GetStringUTFChars(jOutJpeg, nullptr);
     SuperCCDProcessor processor;
     QString error;
     bool ok = processor.renderLibRawJpeg(QString::fromLocal8Bit(in),
                                          QString::fromLocal8Bit(out),
-                                         maxSize, error);
+                                         maxSize, demosaic,
+                                         halfSize == JNI_TRUE, error);
     env->ReleaseStringUTFChars(jIn, in);
     env->ReleaseStringUTFChars(jOutJpeg, out);
     if (!ok) LOGE("fuji render failed: %s", error.toStdString().c_str());

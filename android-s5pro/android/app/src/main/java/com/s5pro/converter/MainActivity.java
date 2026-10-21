@@ -11,6 +11,7 @@ import android.graphics.Color;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.pdf.PdfDocument;
@@ -30,6 +31,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ArrayAdapter;
+import android.widget.FrameLayout;
 import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -60,7 +62,8 @@ public class MainActivity extends Activity {
                                        double start, double delay, double smoothness);
     public native boolean nativeExtractThumbnail(String inPath, String outJpegPath);
     public native String nativeReadMetadata(String inPath);
-    public native boolean nativeRenderFujiJpeg(String inPath, String outJpegPath, int maxSize);
+    public native boolean nativeRenderFujiJpeg(String inPath, String outJpegPath,
+                                               int maxSize, int demosaic, boolean halfSize);
 
     static final int ST_PENDING = 0, ST_THUMB_OK = 1, ST_WORKING = 2, ST_DONE = 3, ST_ERROR = 4;
 
@@ -70,6 +73,7 @@ public class MainActivity extends Activity {
         String thumbJpeg;          // embedded preview, full extracted size (<=512)
         Bitmap rowThumb; String meta;
         boolean shareSaved;
+        String fujiWmPath;         // watermarked fuji-render cache (for compare)
     }
 
     class RafAdapter extends BaseAdapter {
@@ -106,7 +110,9 @@ public class MainActivity extends Activity {
     TextView advVals;
     android.widget.CheckBox fujiCheck;
     Spinner sizePreset;
+    Spinner demoSpinner;
     android.widget.CheckBox effBW, effSepia, effBright, effContrast, renameDate;
+    android.widget.CheckBox halfCheck, dngCheck;
     Button exportPdf;
     final List<String> pdfSources = new ArrayList<>();
     volatile boolean converting;
@@ -132,6 +138,14 @@ public class MainActivity extends Activity {
         ArrayAdapter<String> sa = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
                 new String[]{"长边 1600px", "长边 1080px", "方图 1080×1080", "全尺寸"});
         sizePreset.setAdapter(sa);
+        demoSpinner = findViewById(R.id.demoSpinner);
+        ArrayAdapter<String> da = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"解码管线：默认 AHD", "解码管线：PPG", "解码管线：VNG",
+                        "解码管线：线性（最快）", "解码管线：DCB", "解码管线：DHT", "解码管线：AAHD"});
+        demoSpinner.setAdapter(da);
+        halfCheck = findViewById(R.id.halfCheck);
+        dngCheck = findViewById(R.id.dngCheck);
+        dngCheck.setChecked(true);
         effBW = findViewById(R.id.effBW);
         effSepia = findViewById(R.id.effSepia);
         effBright = findViewById(R.id.effBright);
@@ -176,6 +190,8 @@ public class MainActivity extends Activity {
             if (!any) { Toast.makeText(this, "没有待转换的文件", Toast.LENGTH_SHORT).show(); return; }
             startConversion();
         });
+
+        list.setOnItemClickListener((parent, view, position, id) -> openCompare(items.get(position)));
 
         list.setOnItemLongClickListener((parent, view, position, id) -> {
             RafItem it = items.get(position);
@@ -371,21 +387,34 @@ public class MainActivity extends Activity {
             copyStream(getContentResolver().openInputStream(it.uri), raf);
             String base = outputBase(it);
             File dng = new File(getCacheDir(), base + "_merged.dng");
-            String err = nativeConvert(raf.getAbsolutePath(), dng.getAbsolutePath(),
-                    advStart(), advDelay(), advSmooth());
-            if (err != null) { cleanup(raf); return err; }
-            Uri savedDng = saveToDownloads(base + "_merged.dng", dng, "image/x-adobe-dng");
+            if (!dngCheck.isChecked() && !fujiCheck.isChecked()) {
+                cleanup(raf);
+                return "DNG 与 JPEG 输出均未勾选";
+            }
+            if (dngCheck.isChecked()) {
+                String derr = nativeConvert(raf.getAbsolutePath(), dng.getAbsolutePath(),
+                        advStart(), advDelay(), advSmooth());
+                if (derr != null) { cleanup(raf); return derr; }
+                Uri savedDng = saveToDownloads(base + "_merged.dng", dng, "image/x-adobe-dng");
+                if (savedDng == null) { cleanup(raf); return "保存 DNG 到 Download 失败"; }
+            }
             boolean share = false;
             File fujiJpg = new File(getCacheDir(), base + "_fuji.jpg");
             if (fujiCheck.isChecked()) {
                 // Fuji color mode: full LibRaw display render (camera WB +
-                // dcraw S5 Pro matrix + sRGB + fuji_rotate), then watermark.
-                if (nativeRenderFujiJpeg(raf.getAbsolutePath(), fujiJpg.getAbsolutePath(), presetEdge() > 0 ? Math.max(presetEdge(), 1600) : 0)) {
+                // dcraw S5 Pro matrix + sRGB + fuji_rotate), selectable
+                // demosaic pipeline, then watermark.
+                int edge = presetEdge() > 0 ? Math.max(presetEdge(), 1600) : 0;
+                if (nativeRenderFujiJpeg(raf.getAbsolutePath(), fujiJpg.getAbsolutePath(),
+                        edge, demosaicSel(), halfCheck.isChecked())) {
                     File out = new File(getCacheDir(), base + "_wm.jpg");
                     if (watermarkJpeg(fujiJpg, out)) {
                         Uri u = saveToDownloads(base + "_fuji.jpg", out, "image/jpeg");
                         share = (u != null);
-                        if (share) pdfSources.add(out.getAbsolutePath());
+                        if (share) {
+                            pdfSources.add(out.getAbsolutePath());
+                            it.fujiWmPath = out.getAbsolutePath();   // kept for compare
+                        }
                     }
                 }
                 cleanup(fujiJpg);
@@ -397,7 +426,6 @@ public class MainActivity extends Activity {
                 }
             }
             cleanup(raf); cleanup(dng);
-            if (savedDng == null) return "保存 DNG 到 Download 失败";
             it.shareSaved = share;
             return null;
         } catch (Exception e) {
@@ -519,7 +547,98 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------------- PDF contact sheet ----------------
+    int demosaicSel() {
+        switch (demoSpinner.getSelectedItemPosition()) {
+            case 1: return 2;   // PPG
+            case 2: return 1;   // VNG
+            case 3: return 0;   // linear
+            case 4: return 4;   // DCB
+            case 5: return 11;  // DHT
+            case 6: return 12;  // AAHD
+            default: return -1; // LibRaw default (AHD)
+        }
+    }
+
+    // ---------------- before/after compare ----------------
+
+    void openCompare(RafItem it) {
+        if (it.thumbJpeg == null || it.fujiWmPath == null) {
+            Toast.makeText(this, "对比需要：已生成预览 + 已完成富士色彩转换", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Bitmap before = decodeScaled(it.thumbJpeg, 1080);
+        Bitmap after = decodeScaled(it.fujiWmPath, 1080);
+        if (before == null || after == null) {
+            Toast.makeText(this, "图片解码失败", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int w = Math.min(before.getWidth(), after.getWidth());
+        int h = Math.min(before.getHeight(), after.getHeight());
+        before = Bitmap.createScaledBitmap(before, w, h, true);
+        after = Bitmap.createScaledBitmap(after, w, h, true);
+
+        final FrameLayout fl = new FrameLayout(this);
+        ImageView ivB = new ImageView(this);
+        ivB.setImageBitmap(before);
+        ivB.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        ImageView ivA = new ImageView(this);
+        ivA.setImageBitmap(after);
+        ivA.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        fl.addView(ivB, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        fl.addView(ivA, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.HORIZONTAL);
+        TextView lb = new TextView(this);
+        lb.setText("左：内嵌预览"); lb.setTextColor(Color.WHITE); lb.setPadding(8, 4, 8, 4);
+        TextView la = new TextView(this);
+        la.setText("右：富士渲染"); la.setTextColor(Color.WHITE); la.setPadding(8, 4, 8, 4);
+        la.setGravity(1);
+        labels.addView(lb, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        labels.addView(la, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        SeekBar sb = new SeekBar(this);
+        sb.setMax(100);
+        sb.setProgress(50);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.addView(fl, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (getResources().getDisplayMetrics().widthPixels * 0.66f)));
+        box.addView(labels, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        box.addView(sb, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int prog, boolean fromUser) {
+                float frac = prog / 100f;
+                ivA.post(() -> ivA.setClipBounds(new Rect(0, 0,
+                        (int) (ivA.getWidth() * frac), ivA.getHeight())));
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) { }
+            @Override public void onStopTrackingTouch(SeekBar s) { }
+        });
+        ivA.post(() -> ivA.setClipBounds(new Rect(0, 0, ivA.getWidth() / 2, ivA.getHeight())));
+
+        new AlertDialog.Builder(this)
+                .setTitle("前后对比 · " + it.name)
+                .setView(box)
+                .setPositiveButton("关闭", null)
+                .show();
+    }
+
+    Bitmap decodeScaled(String path, int target) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inSampleSize = sampleFor(path, target);
+        Bitmap b = BitmapFactory.decodeFile(path, o);
+        if (b != null && b.getWidth() > target) {
+            b = Bitmap.createScaledBitmap(b, target, target * b.getHeight() / b.getWidth(), true);
+        }
+        return b;
+    }
 
     void exportContactSheet() {
         if (pdfSources.isEmpty()) {

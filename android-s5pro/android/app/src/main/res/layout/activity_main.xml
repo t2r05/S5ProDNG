@@ -95,6 +95,34 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"/>
 
+        <Spinner
+            android:id="@+id/demoSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <CheckBox
+                android:id="@+id/halfCheck"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="半尺寸快渲"
+                android:textSize="13sp"/>
+
+            <CheckBox
+                android:id="@+id/dngCheck"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="输出 DNG"
+                android:textSize="13sp"
+                android:checked="true"/>
+        </LinearLayout>
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
