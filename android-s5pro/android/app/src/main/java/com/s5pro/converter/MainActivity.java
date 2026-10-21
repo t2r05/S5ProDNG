@@ -111,6 +111,7 @@ public class MainActivity extends Activity {
     android.widget.CheckBox fujiCheck;
     Spinner sizePreset;
     Spinner demoSpinner;
+    Spinner filmSpinner;
     android.widget.CheckBox effBW, effSepia, effBright, effContrast, renameDate;
     android.widget.CheckBox halfCheck, dngCheck;
     Button exportPdf;
@@ -143,6 +144,11 @@ public class MainActivity extends Activity {
                 new String[]{"解码管线：默认 AHD", "解码管线：PPG", "解码管线：VNG",
                         "解码管线：线性（最快）", "解码管线：DCB", "解码管线：DHT", "解码管线：AAHD"});
         demoSpinner.setAdapter(da);
+        filmSpinner = findViewById(R.id.filmSpinner);
+        ArrayAdapter<String> fa = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"胶片模式：不套用", "胶片：Standard 标准", "胶片：F1 影棚人像",
+                        "胶片：F1a 高饱和", "胶片：F1b 肤色平滑", "胶片：F1c 高对比锐利", "胶片：F2 Velvia 风"});
+        filmSpinner.setAdapter(fa);
         halfCheck = findViewById(R.id.halfCheck);
         dngCheck = findViewById(R.id.dngCheck);
         dngCheck.setChecked(true);
@@ -472,10 +478,74 @@ public class MainActivity extends Activity {
 
     boolean presetSquare() { return sizePreset.getSelectedItemPosition() == 2; }
 
-    /** Combined ColorMatrix from the effect checkboxes; null if none. */
+    /** Film-simulation approximation matrix; null = no-op. Approximations of
+     *  Standard / F1 / F1a / F1b / F1c / F2 (HS-V3 allows re-selecting film
+     *  modes at development time; exact Fuji matrices are proprietary). */
+    ColorMatrix filmMatrix() {
+        ColorMatrix m = new ColorMatrix();
+        int sel = filmSpinner.getSelectedItemPosition();
+        if (sel <= 0) return null;
+        ColorMatrix sat = new ColorMatrix();
+        ColorMatrix tone = new ColorMatrix();
+        ColorMatrix tint = null;
+        switch (sel) {
+            case 1: // Standard: identity (LibRaw render is already the standard look)
+                return null;
+            case 2: // F1 studio-portrait chrome: gently muted, warm skin, soft contrast
+                sat.setSaturation(0.88f);
+                tone.setScale(0.96f, 0.96f, 0.96f, 1f);
+                tint = new ColorMatrix(new float[]{
+                        1, 0, 0, 0, 6,
+                        0, 1, 0, 0, 2,
+                        0, 0, 1, 0, -4,
+                        0, 0, 0, 1, 0});
+                break;
+            case 3: // F1a: more saturation, slight contrast
+                sat.setSaturation(1.18f);
+                tone.setScale(1.06f, 1.06f, 1.06f, 1f);
+                tint = new ColorMatrix(new float[]{
+                        1, 0, 0, 0, -8,
+                        0, 1, 0, 0, -8,
+                        0, 0, 1, 0, -8,
+                        0, 0, 0, 1, 0});
+                break;
+            case 4: // F1b daylight-portrait: smoother/lower contrast, gentle warm
+                sat.setSaturation(0.95f);
+                tone.setScale(0.92f, 0.92f, 0.92f, 1f);
+                tint = new ColorMatrix(new float[]{
+                        1, 0, 0, 0, 12,
+                        0, 1, 0, 0, 4,
+                        0, 0, 1, 0, 0,
+                        0, 0, 0, 1, 0});
+                break;
+            case 5: // F1c: contrasty/sharp look
+                sat.setSaturation(1.05f);
+                tone.setScale(1.10f, 1.10f, 1.10f, 1f);
+                tint = new ColorMatrix(new float[]{
+                        1, 0, 0, 0, -14,
+                        0, 1, 0, 0, -14,
+                        0, 0, 1, 0, -14,
+                        0, 0, 0, 1, 0});
+                break;
+            case 6: // F2 Velvia-like: punchy
+                sat.setSaturation(1.35f);
+                tone.setScale(1.12f, 1.12f, 1.12f, 1f);
+                tint = new ColorMatrix(new float[]{
+                        1, 0, 0, 0, -16,
+                        0, 1, 0, 0, -16,
+                        0, 0, 1, 0, -16,
+                        0, 0, 0, 1, 0});
+                break;
+        }
+        m.postConcat(sat);
+        m.postConcat(tone);
+        if (tint != null) m.postConcat(tint);
+        return m;
+    }
+
+    /** Combined ColorMatrix from the quick-effect checkboxes (composed with
+     *  the film preset); null = no-op. */
     ColorMatrix effectMatrix() {
-        boolean any = effBW.isChecked() || effSepia.isChecked() || effBright.isChecked() || effContrast.isChecked();
-        if (!any) return null;
         ColorMatrix m = new ColorMatrix();
         if (effBW.isChecked()) m.setSaturation(0f);
         if (effSepia.isChecked()) {
@@ -499,6 +569,8 @@ public class MainActivity extends Activity {
                     0, 0, 0, 1, 0});
             m.postConcat(c);
         }
+        ColorMatrix film = filmMatrix();
+        if (film != null) m.postConcat(film);
         return m;
     }
 
