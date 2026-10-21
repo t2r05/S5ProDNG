@@ -13,11 +13,11 @@ option(S5CONV_ANDROID "Build for Android (JNI shared library)" OFF)
 # ------------------------------------------------------------- third party
 set(THIRD ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
-# ----- zlib (static)
+# ----- zlib (static) — gz* file-API sources excluded: libtiff only needs the
+# deflate/inflate core, and gzlib/gzread/gzwrite need HAVE_UNISTD_H quirks on bionic
 set(ZLIB_SRC
     ${THIRD}/zlib/adler32.c ${THIRD}/zlib/compress.c ${THIRD}/zlib/crc32.c
-    ${THIRD}/zlib/deflate.c ${THIRD}/zlib/gzclose.c ${THIRD}/zlib/gzlib.c
-    ${THIRD}/zlib/gzread.c ${THIRD}/zlib/gzwrite.c ${THIRD}/zlib/infback.c
+    ${THIRD}/zlib/deflate.c ${THIRD}/zlib/infback.c
     ${THIRD}/zlib/inffast.c ${THIRD}/zlib/inflate.c ${THIRD}/zlib/inftrees.c
     ${THIRD}/zlib/trees.c ${THIRD}/zlib/uncompr.c ${THIRD}/zlib/zutil.c)
 add_library(zlib_s STATIC ${ZLIB_SRC})

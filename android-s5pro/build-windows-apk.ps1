@@ -1,13 +1,17 @@
 # build-windows-apk.ps1 - manual APK build (no Gradle/AGP)
 #   native: NDK cmake -> libs5dng.so (arm64-v8a)
-#   java:   javac -> jar -> d8
-#   pkg:    aapt2 compile/link -> zip append -> zipalign -> apksigner
+#   res:    aapt2 compile/link (+R.java)
+#   java:   javac -> d8
+#   pkg:    zip append -> zipalign -> apksigner
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path       # android-s5pro
 $Proj = Split-Path -Parent $Root                              # workspace root
 $EB   = Join-Path $Proj 'tools\android-build'
 
-$jdk  = (Get-ChildItem "$EB\jdk" -Directory | Select-Object -First 1).FullName
+$jdkCand = Get-ChildItem "$EB\jdk" -Directory | Select-Object -First 1
+if (Test-Path "$EB\jdk\bin\java.exe") { $jdk = "$EB\jdk" }
+elseif ($jdkCand -and (Test-Path "$($jdkCand.FullName)\bin\java.exe")) { $jdk = $jdkCand.FullName }
+else { throw "JDK not found under $EB\jdk" }
 $sdk  = Join-Path $EB 'sdk'
 $bt   = (Get-ChildItem "$sdk\build-tools" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
 $jar  = "$sdk\platforms\android-34\android.jar"
@@ -16,6 +20,8 @@ $msysBin = Join-Path $Proj 'tools\msys64\mingw64\bin'
 
 $env:JAVA_HOME = $jdk
 $env:PATH = "$jdk\bin;$msysBin;$env:PATH"
+$build = "$Root\android\app\build"
+New-Item -ItemType Directory -Force -Path "$build\obj", "$build\gen" | Out-Null
 
 Write-Host "== [1/6] native libs5dng.so (arm64-v8a) =="
 $buildN = "$Root\build-android"
@@ -30,26 +36,25 @@ if ($LASTEXITCODE -ne 0) { throw "native build failed" }
 $so = "$buildN\libs5dng.so"
 Write-Host "so: $((Get-Item $so).Length) bytes"
 
-Write-Host "== [2/6] java compile =="
-$build = "$Root\android\app\build"
-New-Item -ItemType Directory -Force -Path "$build\obj" | Out-Null
-$sources = Get-ChildItem "$Root\android\app\src\main\java" -Recurse -Filter *.java | ForEach-Object { $_.FullName }
-& "$jdk\bin\javac.exe" -source 11 -target 11 -bootclasspath $jar -classpath $jar `
-   -d "$build\obj" $sources
-if ($LASTEXITCODE -ne 0) { throw "javac failed" }
-& "$jdk\bin\jar.exe" cf "$build\classes.jar" -C "$build\obj" .
-
-Write-Host "== [3/6] dex =="
-& "$bt\d8.bat" --lib $jar --release --min-api 29 --output $build "$build\classes.jar"
-if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
-
-Write-Host "== [4/6] package resources =="
+Write-Host "== [2/6] resources + R.java =="
 & "$bt\aapt2.exe" compile --dir "$Root\android\app\src\main\res" -o "$build\res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 & "$bt\aapt2.exe" link -o "$build\unsigned.apk" -I $jar `
    --min-sdk-version 29 --target-sdk-version 34 `
+   --java "$build\gen" `
    --manifest "$Root\android\app\src\main\AndroidManifest.xml" "$build\res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
+
+Write-Host "== [3/6] java compile =="
+$sources = @(Get-ChildItem "$Root\android\app\src\main\java" -Recurse -Filter *.java | ForEach-Object { $_.FullName })
+$sources += Get-ChildItem "$build\gen" -Recurse -Filter *.java | ForEach-Object { $_.FullName }
+& "$jdk\bin\javac.exe" -encoding UTF-8 -classpath $jar -d "$build\obj" $sources
+if ($LASTEXITCODE -ne 0) { throw "javac failed" }
+
+Write-Host "== [4/6] dex =="
+& "$jdk\bin\jar.exe" cf "$build\classes.jar" -C "$build\obj" .
+& "$bt\d8.bat" --lib $jar --release --min-api 29 --output $build "$build\classes.jar"
+if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 
 Write-Host "== [5/6] add dex + native lib =="
 python "$Root\scripts\apk_add.py" "$build\unsigned.apk" "$build\classes.dex" $so
