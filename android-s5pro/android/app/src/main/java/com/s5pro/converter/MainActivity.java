@@ -8,8 +8,12 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.pdf.PdfDocument;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
@@ -25,7 +29,9 @@ import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ArrayAdapter;
 import android.widget.SeekBar;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -35,8 +41,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
@@ -94,6 +105,10 @@ public class MainActivity extends Activity {
     SeekBar sbStart, sbDelay, sbSmooth;
     TextView advVals;
     android.widget.CheckBox fujiCheck;
+    Spinner sizePreset;
+    android.widget.CheckBox effBW, effSepia, effBright, effContrast, renameDate;
+    Button exportPdf;
+    final List<String> pdfSources = new ArrayList<>();
     volatile boolean converting;
     final Handler main = new Handler(Looper.getMainLooper());
 
@@ -113,6 +128,17 @@ public class MainActivity extends Activity {
         advVals = findViewById(R.id.advVals);
         fujiCheck = findViewById(R.id.fujiCheck);
         fujiCheck.setChecked(true);
+        sizePreset = findViewById(R.id.sizePreset);
+        ArrayAdapter<String> sa = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"长边 1600px", "长边 1080px", "方图 1080×1080", "全尺寸"});
+        sizePreset.setAdapter(sa);
+        effBW = findViewById(R.id.effBW);
+        effSepia = findViewById(R.id.effSepia);
+        effBright = findViewById(R.id.effBright);
+        effContrast = findViewById(R.id.effContrast);
+        renameDate = findViewById(R.id.renameDate);
+        exportPdf = findViewById(R.id.exportPdf);
+        exportPdf.setOnClickListener(v -> exportContactSheet());
         updateAdvLabel();
 
         SeekBar.OnSeekBarChangeListener advL = new SeekBar.OnSeekBarChangeListener() {
@@ -343,7 +369,7 @@ public class MainActivity extends Activity {
         try {
             File raf = new File(getCacheDir(), "conv.raf");
             copyStream(getContentResolver().openInputStream(it.uri), raf);
-            String base = it.name.replaceAll("\\.[rR][aA][fF]$", "");
+            String base = outputBase(it);
             File dng = new File(getCacheDir(), base + "_merged.dng");
             String err = nativeConvert(raf.getAbsolutePath(), dng.getAbsolutePath(),
                     advStart(), advDelay(), advSmooth());
@@ -352,19 +378,23 @@ public class MainActivity extends Activity {
             boolean share = false;
             File fujiJpg = new File(getCacheDir(), base + "_fuji.jpg");
             if (fujiCheck.isChecked()) {
-                // Fuji color mode: full LibRaw display render honoring the
-                // camera-embedded tone curve, then watermark.
-                if (nativeRenderFujiJpeg(raf.getAbsolutePath(), fujiJpg.getAbsolutePath(), 1600)) {
+                // Fuji color mode: full LibRaw display render (camera WB +
+                // dcraw S5 Pro matrix + sRGB + fuji_rotate), then watermark.
+                if (nativeRenderFujiJpeg(raf.getAbsolutePath(), fujiJpg.getAbsolutePath(), presetEdge() > 0 ? Math.max(presetEdge(), 1600) : 0)) {
                     File out = new File(getCacheDir(), base + "_wm.jpg");
                     if (watermarkJpeg(fujiJpg, out)) {
                         Uri u = saveToDownloads(base + "_fuji.jpg", out, "image/jpeg");
                         share = (u != null);
+                        if (share) pdfSources.add(out.getAbsolutePath());
                     }
-                    cleanup(out);
                 }
                 cleanup(fujiJpg);
             } else if (it.thumbJpeg != null) {
                 share = makeShareJpeg(it, base);
+                if (share) {
+                    File wm = new File(getCacheDir(), base + "_wm.jpg");
+                    if (wm.exists()) pdfSources.add(wm.getAbsolutePath());
+                }
             }
             cleanup(raf); cleanup(dng);
             if (savedDng == null) return "保存 DNG 到 Download 失败";
@@ -384,27 +414,93 @@ public class MainActivity extends Activity {
             boolean ok = watermarkJpeg(src, out);
             if (!ok) return false;
             Uri u = saveToDownloads(base + "_share.jpg", out, "image/jpeg");
-            cleanup(out);
             return u != null;
         } catch (Exception e) {
             return false;
         }
     }
 
-    /** Decodes src (<=1600px), draws the watermark, writes JPEG. */
+    String outputBase(RafItem it) {
+        String base = it.name == null ? "DSCF" : it.name.replaceAll("\\.[rR][aA][fF]$", "");
+        if (renameDate.isChecked() && it.meta != null) {
+            Matcher m = Pattern.compile("\"dateTime\":\"([^\"]+)\"").matcher(it.meta);
+            if (m.find()) {
+                String dt = m.group(1).replaceAll("[^0-9]", "");
+                if (dt.length() >= 14) base = "S5_" + dt.substring(0, 14);
+            }
+        }
+        return base;
+    }
+
+    /** Preset long-edge target for the final JPEG; -1 = full size. */
+    int presetEdge() {
+        switch (sizePreset.getSelectedItemPosition()) {
+            case 1: return 1080;
+            case 2: return 1080;
+            case 3: return -1;
+            default: return 1600;
+        }
+    }
+
+    boolean presetSquare() { return sizePreset.getSelectedItemPosition() == 2; }
+
+    /** Combined ColorMatrix from the effect checkboxes; null if none. */
+    ColorMatrix effectMatrix() {
+        boolean any = effBW.isChecked() || effSepia.isChecked() || effBright.isChecked() || effContrast.isChecked();
+        if (!any) return null;
+        ColorMatrix m = new ColorMatrix();
+        if (effBW.isChecked()) m.setSaturation(0f);
+        if (effSepia.isChecked()) {
+            ColorMatrix tone = new ColorMatrix();
+            tone.setScale(1.2f, 1.0f, 0.78f, 1f);
+            m.postConcat(tone);
+            ColorMatrix sat = new ColorMatrix();
+            sat.setSaturation(0.65f);
+            m.postConcat(sat);
+        }
+        if (effBright.isChecked()) {
+            ColorMatrix b = new ColorMatrix();
+            b.setScale(1.25f, 1.25f, 1.25f, 1f);
+            m.postConcat(b);
+        }
+        if (effContrast.isChecked()) {
+            ColorMatrix c = new ColorMatrix(new float[]{
+                    1.18f, 0, 0, 0, -24,
+                    0, 1.18f, 0, 0, -24,
+                    0, 0, 1.18f, 0, -24,
+                    0, 0, 0, 1, 0});
+            m.postConcat(c);
+        }
+        return m;
+    }
+
+    /** Decodes src with preset size/effects, draws the watermark, writes JPEG. */
     boolean watermarkJpeg(File src, File out) {
         try {
+            int edge = presetEdge() > 0 ? presetEdge() : 4096;
             BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inSampleSize = sampleFor(src.getAbsolutePath(), 1600);
+            o.inSampleSize = sampleFor(src.getAbsolutePath(), edge);
             Bitmap b = BitmapFactory.decodeFile(src.getAbsolutePath(), o);
             if (b == null) return false;
             Bitmap work = b;
-            if (b.getWidth() > 1600) {
-                work = Bitmap.createScaledBitmap(b, 1600, 1600 * b.getHeight() / b.getWidth(), true);
+            int edgeLimit = presetEdge() > 0 ? presetEdge() : Math.max(b.getWidth(), b.getHeight());
+            if (presetSquare()) {
+                int side = Math.min(b.getWidth(), b.getHeight());
+                int x0 = (b.getWidth() - side) / 2, y0 = (b.getHeight() - side) / 2;
+                work = Bitmap.createBitmap(b, x0, y0, side, side);
+                if (side > edgeLimit) {
+                    Bitmap s2 = Bitmap.createScaledBitmap(work, edgeLimit, edgeLimit, true);
+                    if (s2 != work) { work = s2; }
+                }
+            } else if (b.getWidth() > edgeLimit || b.getHeight() > edgeLimit) {
+                work = Bitmap.createScaledBitmap(b, edgeLimit, edgeLimit * b.getHeight() / b.getWidth(), true);
             }
             Bitmap outB = work.copy(Bitmap.Config.ARGB_8888, true);
-            if (outB != work) work = outB;
-            Canvas c = new Canvas(work);
+            Canvas c = new Canvas(outB);
+            Paint draw = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+            ColorMatrix cm = effectMatrix();
+            if (cm != null) draw.setColorFilter(new ColorMatrixColorFilter(cm));
+            c.drawBitmap(work, 0, 0, draw);
             Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
             p.setColor(Color.WHITE);
             p.setShadowLayer(4, 2, 2, Color.argb(160, 0, 0, 0));
@@ -415,12 +511,83 @@ public class MainActivity extends Activity {
             c.drawText(txt, work.getWidth() - tw - work.getWidth() * 0.03f,
                     work.getHeight() - work.getWidth() * 0.03f, p);
             try (FileOutputStream fos = new FileOutputStream(out)) {
-                work.compress(Bitmap.CompressFormat.JPEG, 90, fos);
+                outB.compress(Bitmap.CompressFormat.JPEG, 90, fos);
             }
             return true;
         } catch (Exception e) {
             return false;
         }
+    }
+
+    // ---------------- PDF contact sheet ----------------
+
+    void exportContactSheet() {
+        if (pdfSources.isEmpty()) {
+            Toast.makeText(this, "先转换出 JPEG，再导出接触表", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(this, "正在生成接触表…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String err = null;
+            try {
+                File pdf = new File(getCacheDir(), "sheet.pdf");
+                PdfDocument doc = new PdfDocument();
+                final int W = 595, H = 842, perPage = 6;
+                final int cellW = W / 3, cellH = (H - 40) / 2;
+                Paint head = new Paint(Paint.ANTI_ALIAS_FLAG);
+                head.setColor(Color.BLACK); head.setTextSize(11); head.setTypeface(Typeface.DEFAULT_BOLD);
+                Paint cap = new Paint(Paint.ANTI_ALIAS_FLAG);
+                cap.setColor(Color.DKGRAY); cap.setTextSize(7);
+                int pages = (pdfSources.size() + perPage - 1) / perPage;
+                SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US);
+                for (int pg = 0; pg < pages; pg++) {
+                    PdfDocument.Page page = doc.startPage(
+                            new PdfDocument.PageInfo.Builder(W, H, pg + 1).create());
+                    Canvas c = page.getCanvas();
+                    c.drawText("S5ProDNG Contact Sheet · " + f.format(new Date())
+                            + " · " + (pg + 1) + "/" + pages, 12, 18, head);
+                    for (int k = 0; k < perPage; k++) {
+                        int idx = pg * perPage + k;
+                        if (idx >= pdfSources.size()) break;
+                        int cx = (k % 3) * cellW, cy = 28 + (k / 3) * cellH;
+                        Bitmap b = decodeFit(pdfSources.get(idx), cellW - 12, cellH - 26);
+                        if (b != null) {
+                            c.drawBitmap(b, null, new RectF(cx + 6, cy + 4,
+                                    cx + cellW - 6, cy + cellH - 22), null);
+                            b.recycle();
+                        }
+                        c.drawText(new File(pdfSources.get(idx)).getName(),
+                                cx + 8, cy + cellH - 8, cap);
+                    }
+                    doc.finishPage(page);
+                }
+                try (FileOutputStream fos = new FileOutputStream(pdf)) {
+                    doc.writeTo(fos);
+                }
+                doc.close();
+                Uri u = saveToDownloads("S5ProDNG_contact_"
+                        + (System.currentTimeMillis() / 1000) + ".pdf", pdf, "application/pdf");
+                cleanup(pdf);
+                if (u == null) err = "保存 PDF 失败";
+            } catch (Exception e) {
+                err = e.getClass().getSimpleName() + ": " + e.getMessage();
+            }
+            final String e2 = err;
+            main.post(() -> Toast.makeText(this,
+                    e2 == null ? "接触表已存 Download/s5dng/" : "PDF 失败: " + e2,
+                    Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
+    Bitmap decodeFit(String path, int tw, int th) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(path, o);
+        int s = 1;
+        while (o.outWidth / (s * 2) >= tw * 2 && o.outHeight / (s * 2) >= th * 2) s *= 2;
+        o = new BitmapFactory.Options();
+        o.inSampleSize = s;
+        return BitmapFactory.decodeFile(path, o);
     }
 
     void cleanup(File f) { //noinspection ResultOfMethodCallIgnored

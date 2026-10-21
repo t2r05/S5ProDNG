@@ -89,6 +89,56 @@
             android:text="同时输出富士色彩 JPEG（相机白平衡+富士色矩阵渲染，推荐）"
             android:textSize="13sp"
             android:checked="true"/>
+
+        <Spinner
+            android:id="@+id/sizePreset"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <CheckBox
+                android:id="@+id/effBW"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="黑白"
+                android:textSize="13sp"/>
+
+            <CheckBox
+                android:id="@+id/effSepia"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="棕褐"
+                android:textSize="13sp"/>
+
+            <CheckBox
+                android:id="@+id/effBright"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="亮度+"
+                android:textSize="13sp"/>
+
+            <CheckBox
+                android:id="@+id/effContrast"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="对比+"
+                android:textSize="13sp"/>
+        </LinearLayout>
+
+        <CheckBox
+            android:id="@+id/renameDate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="按拍摄时间重命名（S5_yyyyMMddHHmmss）"
+            android:textSize="13sp"/>
     </LinearLayout>
 
     <TextView
@@ -98,6 +148,13 @@
         android:textSize="13sp"
         android:paddingTop="6dp"
         android:paddingBottom="4dp"/>
+
+    <Button
+        android:id="@+id/exportPdf"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="导出接触表 PDF"
+        android:textSize="13sp"/>
 
     <ListView
         android:id="@+id/list"
