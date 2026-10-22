@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>富士 S5 Pro 肤色与转换器逆向研究 · S5ProDNG</title>
+<style>
+  :root { --ink:#1a1a2e; --paper:#faf9f6; --accent:#8b2635; --soft:#e9e5dc; --gray:#6b6b6b; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"Source Han Serif SC","Noto Serif SC","SimSun",serif; background:var(--paper); color:var(--ink); line-height:1.85; }
+  .wrap { max-width:860px; margin:0 auto; padding:56px 32px 96px; }
+  header.masthead { border-bottom:4px double var(--accent); padding-bottom:28px; margin-bottom:44px; }
+  h1 { font-size:2.35em; letter-spacing:.04em; font-weight:700; }
+  .sub { color:var(--gray); font-size:1.02em; margin-top:10px; font-family:"KaiTi",serif; }
+  h2 { font-size:1.45em; color:var(--accent); margin:52px 0 18px; padding-left:14px; border-left:5px solid var(--accent); }
+  h3 { font-size:1.12em; margin:30px 0 10px; }
+  p { margin:12px 0; text-align:justify; }
+  table { width:100%; border-collapse:collapse; margin:18px 0; font-size:.92em; background:#fff; }
+  th { background:var(--ink); color:#fff; padding:9px 12px; text-align:left; font-weight:600; }
+  td { padding:8px 12px; border-bottom:1px solid var(--soft); vertical-align:top; }
+  tr:nth-child(even) td { background:#f4f1ea; }
+  blockquote { margin:16px 0; padding:14px 22px; background:#fff; border-left:4px solid var(--soft); color:#444; font-size:.95em; }
+  .tag { display:inline-block; background:var(--accent); color:#fff; font-size:.72em; padding:2px 10px; border-radius:3px; margin-right:6px; font-family:sans-serif; vertical-align:middle; }
+  .note { background:#fdf6e3; border:1px solid #e8dcb8; padding:12px 18px; font-size:.9em; margin:14px 0; }
+  .good { color:#1d6b3c; font-weight:700; } .bad { color:#a03030; font-weight:700; }
+  code { background:#eee; padding:1px 6px; border-radius:3px; font-size:.88em; font-family:Consolas,monospace; }
+  ul,ol { margin:10px 0 10px 26px; } li { margin:6px 0; }
+  footer { margin-top:72px; padding-top:20px; border-top:1px solid var(--soft); color:var(--gray); font-size:.85em; }
+  .kpi { display:flex; gap:14px; flex-wrap:wrap; margin:18px 0; }
+  .kpi div { flex:1; min-width:150px; background:#fff; border:1px solid var(--soft); padding:14px 16px; text-align:center; }
+  .kpi b { display:block; font-size:1.6em; color:var(--accent); }
+  .kpi span { font-size:.85em; color:var(--gray); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>富士 S5 Pro 肤色与转换器逆向研究</h1>
+  <div class="sub">SuperCCD SR 双帧结构 · 富士官方转换器演进 · Contenta 竞品逆向 · S5ProDNG 安卓实现 —— 2026-10-22 定稿</div>
+</header>
+
+<h2>一、研究对象：S5 Pro 与它的双帧传感器</h2>
+<p>富士 FinePix S5 Pro（2006-09 上市，参考价 ￥9,880）基于尼康 D200 机身，核心是自研 <b>SuperCCD SR II</b> 传感器：每个像点由两颗光电二极管组成——<b>S 像素</b>（常规灵敏度，负责中间调）与 <b>R 像素</b>（低灵敏度，专捕高光），各 617 万、14-bit。因此 S5 Pro 的 RAF 文件实际是<b>「双帧」文件</b>：S 帧与 R 帧两套独立数据，配合机身 100%–400% 六档动态范围设置。</p>
+<div class="kpi">
+  <div><b>617万×2</b><span>S+R 双光电二极管</span></div>
+  <div><b>14-bit</b><span>RAW 位深</span></div>
+  <div><b>400%</b><span>最高动态范围</span></div>
+  <div><b>F1–F2</b><span>胶片模拟五档</span></div>
+</div>
+<p>这一结构成就了 S5 Pro 的招牌：<b>高光不死白、肤色有「密度」</b>——R 像素让过曝 1–2 档的高光仍可完整恢复，官方引擎再把 R 数据展开为平滑的肤色高光过渡。</p>
+
+<h2>二、关键考据：RAF 里到底存了什么</h2>
+<table>
+  <tr><th>数据</th><th>在 RAF 里的状态</th><th>第三方引擎能否利用</th></tr>
+  <tr><td>S 帧数据（6MP CFA）</td><td>完整存储</td><td class="good">LibRaw/dcraw 可读（但丢 R 帧）</td></tr>
+  <tr><td>R 帧数据（高光帧）</td><td>完整存储</td><td class="bad">通用引擎全部忽略</td></tr>
+  <tr><td>白平衡 / 黑位 / RAFData</td><td>富士私有 tag 区</td><td class="good">LibRaw parse_fuji 可读</td></tr>
+  <tr><td>机身色调曲线表</td><td class="bad">无可解析曲线表</td><td class="bad">不存在（源码级验证）</td></tr>
+  <tr><td>胶片模式选择</td><td>记录于内嵌 JPEG 富士 makernote（0x1401）</td><td>仅作元数据展示</td></tr>
+</table>
+<blockquote>源码级结论（LibRaw identify.cpp:485 与 parse_fuji 全量核对）：S5 Pro 的 RAF <b>不含可被第三方解析的色调曲线表</b>，LibRaw 的 color.curve 对富士保持恒等。机身色调只存在于 JPEG 管线与闭源官方转换器内部。</blockquote>
+
+<h2>三、富士官方转换器演进时间线</h2>
+<table>
+  <tr><th>时间</th><th>软件</th><th>内核</th><th>S5 Pro</th><th>今天官方下载</th></tr>
+  <tr><td>2002</td><td>RAW File Converter LE</td><td>非 SILKYPIX（拖放简易件）</td><td>✓ 随机附赠</td><td class="bad">无</td></tr>
+  <tr><td>2004–2008</td><td>Hyper-Utility HS-V3</td><td>富士自家（含 <b>3D-LUT</b> 技术）</td><td>✓ 需 HS-V3</td><td class="bad">无（CD 时代）</td></tr>
+  <tr><td>~2010</td><td>RAW File Converter EX 1.0</td><td>SILKYPIX 3</td><td>✓</td><td>已停支持</td></tr>
+  <tr><td>~2013–2018</td><td>EX 2.0（Ver 4.x）</td><td>SILKYPIX</td><td>✓</td><td class="bad">已停支持</td></tr>
+  <tr><td>2017–11</td><td>X RAW Studio</td><td>相机硬件（X-Processor）</td><td class="bad">不支持</td><td>现役（与 S5 无关）</td></tr>
+  <tr><td>2018-11 起</td><td><b>RAW FILE CONVERTER EX 3.0</b></td><td><b>SILKYPIX 8/10 系</b></td><td class="good">✓</td><td class="good">现役 · Ver 8.1.20.0（2026-03-02 更新）</td></tr>
+</table>
+<p>下载页：<code>fujifilm-x.com/support/download/software/raw-file-converter-ex-powered-by-silkypix</code>（免费）。付费正统续任为 SILKYPIX Developer Studio Pro12 for FUJIFILM（￥6,930，自称 Based on EX 3.0，可继承参数）。</p>
+
+<h2>四、「新软件颜色更好」的五个机制</h2>
+<ol>
+  <li><b>引擎代差</b>：SILKYPIX 8/10 的 6MP→12MP 去马赛克与色彩矩阵算法，比 2004–2006 年的 HS-V3 自家引擎新了两代。dpreview 用户 fPrime（2021）实测 EX 3.0：「tones and contrast just about perfect… reducing the skin tones from blocking up, now the face looks much more natural」。</li>
+  <li><b>白平衡求解更准</b>：灰点工具更容易命中，肤色基底就正。</li>
+  <li><b>色调曲线更柔性</b>：可降低对比，避免肤色暗部堵塞。</li>
+  <li><b>独家色彩科技授权</b>：HS-V3 新版为 SR II 开发了 <b>3D-LUT</b> 立体查找表；社区共识「<b>只有 Silkypix 和 Capture One 拿到了富士色彩科技授权</b>」（dpreview JNR, 2023）。</li>
+  <li><b>真双帧处理</b>：官方引擎同时消化 S+R 两帧；Adobe 只用 S 帧，高光扩展无从谈起。</li>
+</ol>
+<div class="note">反方证据照录：photo.net 有用户认为「ACR 5 的高光恢复反而比富士官方软件强」——「官方更好」并非全场景绝对，但肤色认同度官方管线显著占优。</div>
+
+<h2>五、胶片模式与肤色科学</h2>
+<p>S5 Pro 机身胶片模式全套：<b>Standard</b> / <b>F1</b>（影棚人像负片）/ <b>F1a</b>（饱和略增）/ <b>F1b</b>（日光人像，肤色平滑）/ <b>F1c</b>（高对比锐利）/ <b>F2</b>（=Velvia，浓艳）。三档作用参数为 Color / Tone / Sharpness——Tone 即「把线性数据映射到输出 gamma 的 S 曲线」。HS-V3 / 官方转换器显影 RAF 时<b>支持后期重选胶片模拟</b>（Standard / Pro Negative / F3a / F3b / F3c / Fujichrome），这也是软件端复刻胶片模式的正统先例。</p>
+<p>肤色被称道的本质：R 像素高光冗余 + 官方管线对肤色高光的柔性映射。第三方复刻路径按可行性排序：</p>
+<ul>
+  <li><span class="tag">路线 A</span><b>免费正解</b>：直接用官方 EX 3.0（社区实测「Color handling matches HU」）</li>
+  <li><span class="tag">路线 B</span><b>Lightroom 近似</b>：配置文件回退 Adobe Standard（曲线更平）+ Camera Calibration 手调 + 以 DR400/Color High 机身 JPEG 为靶</li>
+  <li><span class="tag">路线 C</span><b>付费正统</b>：SILKYPIX Pro12 for FUJIFILM</li>
+  <li><span class="tag">路线 D</span><b>情怀完全体</b>：HS-V3（XP 兼容模式）</li>
+  <li><span class="tag">路线 E</span><b>双帧完整自研</b>：S5ProDNG 的路线——DNG 保 S/R 合并，JPEG 走相机白平衡+富士色矩阵</li>
+</ul>
+
+<h2>六、竞品逆向：Contenta Converter PREMIUM 2026</h2>
+<table>
+  <tr><th>项</th><th>发现</th></tr>
+  <tr><td>厂商 / 版本</td><td>ContentaSoft AB（瑞典于默奥）· v9.0.43 · Inno Setup 封装 · 微软 ID 验证签名</td></tr>
+  <tr><td>输入格式</td><td>102 扩展名 / 21 族（RAW 35 种全支持，含 heic/avif/jxl/psd/sid/xcf 等长尾）</td></tr>
+  <tr><td>功能矩阵</td><td>批量队列 · 20+ 平台尺寸预设 · AI 抠图（联网）· 水印 · PDF 相册（1–48 张/页）· 35+ 特效 · EXIF/IPTC/XMP 批量 · FTP/Dropbox/WordPress 云交付</td></tr>
+  <tr><td>引擎披露</td><td>官方透明度页面自述：RAW 引擎 = <b>dcraw</b>；元数据 = <b>ExifTool 7.42</b>（2008 年版本）</td></tr>
+  <tr><td>二进制开包</td><td class="bad">安装器负载为不透明封装（非经典 Inno zlib 结构），标准库不可拆；结论以官方披露+文档为准</td></tr>
+  <tr><td>商业模式</td><td>免费试用 + 一次性买断，Windows 桌面</td></tr>
+</table>
+<p>对本项目的启示：S5ProDNG 以「S5 Pro 专精 + 双帧完整 + 移动离线」为差异化，不追 Contenta 的格式广度与云功能；其批量、水印、PDF 接触表、尺寸预设、效果管线等主干功能已在 v1.3 全部对标落地。</p>
+
+<h2>七、S5ProDNG 安卓 App 功能演进</h2>
+<table>
+  <tr><th>版本</th><th>新增能力</th></tr>
+  <tr><td>v1.0</td><td>LibRaw 解码 S/R 双平面 → 合并 6MP CFA DNG（桌面 CLI 验证）</td></tr>
+  <tr><td>v1.1</td><td>安卓 App：批量队列 · 缩略图墙 · EXIF 面板 · 水印分享 JPEG · S→R 合并曲线滑杆</td></tr>
+  <tr><td>v1.2</td><td>富士色彩 JPEG：LibRaw 显示级渲染（相机白平衡 + dcraw S5 Pro 矩阵 + sRGB + fuji_rotate）</td></tr>
+  <tr><td>v1.3</td><td>尺寸预设 · 黑白/棕褐/亮度/对比 · PDF 接触表 · 拍摄时间重命名</td></tr>
+  <tr><td>v1.4</td><td>七种解码管线切换（AHD/PPG/VNG/线性/DCB/DHT/AAHD）· 半尺寸快渲 · DNG 输出开关 · <b>点击条目前后对比</b>（滑动分割）</td></tr>
+  <tr><td>v1.5</td><td><b>胶片模式预设</b>：Standard / F1 影棚人像 / F1a 高饱和 / F1b 肤色平滑 / F1c 高对比 / F2 Velvia 风（与快速效果可叠加）</td></tr>
+</table>
+<p>下载（GitHub Release，公开）：<code>github.com/t2r05/S5ProDNG/releases</code> · 源码同仓库 MIT 协议开放。</p>
+
+<footer>
+  证据分级说明：官方页面/论坛原帖/dpreview 评测为整页抓取验证；富士软件断代与 X RAW Studio 部分依据搜索摘要；「RAF 无可解析曲线表」为 LibRaw 源码行级核对；Contenta 引擎结论来自其官方透明度披露页。<br>
+  完整引注见同目录《富士RAW转换器研究.md》《肤色科学技术分析.md》《Contenta逆向功能分析.md》。
+</footer>
+
+</div>
+</body>
+</html>
